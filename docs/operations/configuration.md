@@ -35,7 +35,7 @@ Values below are variable names and source defaults, never production secret val
 | Variable                             | Requirement and default                                                                                     |
 | ------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | `ORCHESTRATOR_PORT`                  | Optional; defaults to `3001`. The service does not read generic `PORT`.                                     |
-| `ORCHESTRATOR_HOST`                  | Optional; defaults to `127.0.0.1` (IPv4 loopback). Override only for a deliberate non-local architecture.   |
+| `ORCHESTRATOR_HOST`                  | Optional; defaults to `127.0.0.1` (IPv4 loopback). Compose/self-hosted set `0.0.0.0` so published ports and sibling containers can reach the process; host-side publish stays loopback. |
 | `CORS_ORIGIN`                        | Optional comma-separated allow-list of explicit origins shared with the WebSocket policy. Unset means NO HTTP CORS (the Workbench same-origin proxy needs none). A literal `*` is REJECTED and fails startup — never a wildcard. |
 | `POSTGRES_HOST`, `POSTGRES_PORT`     | Optional; default `localhost`, `5432`.                                                                      |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | Optional; both default to `postgres` for local development. Supply secrets outside source control.          |
@@ -109,7 +109,7 @@ group is killed at the earlier of the invocation deadline and `wallTimeMs`
 | Variable           | Requirement and default                                                 |
 | ------------------ | ----------------------------------------------------------------------- |
 | `GATEWAY_PORT`     | Optional; defaults to `3000`. The service does not read generic `PORT`. |
-| `GATEWAY_HOST`     | Optional; defaults to `127.0.0.1` (IPv4 loopback).                      |
+| `GATEWAY_HOST`     | Optional; defaults to `127.0.0.1` (IPv4 loopback). Compose/self-hosted set `0.0.0.0` so Docker published ports work; host-side publish stays loopback. |
 | `CORS_ORIGIN`      | Optional comma-separated allow-list of explicit origins; shared with the Orchestrator semantics. Unset means NO HTTP CORS. A literal `*` is REJECTED and fails startup. |
 | `ORCHESTRATOR_URL` | Optional; defaults to `http://127.0.0.1:3001` (explicit IPv4 loopback). |
 
@@ -129,6 +129,10 @@ each service, drift-checked by tests):
 - The Workbench same-origin proxy keeps working with no configuration.
 - Human-facing summaries may display `localhost`; internal defaults are
   always explicit `127.0.0.1`.
+- Container profiles (`docker-compose.yml`, self-hosted, compose.dev) set
+  `GATEWAY_HOST`/`ORCHESTRATOR_HOST` to `0.0.0.0` so Docker published ports
+  and sibling containers can reach `/health`. Host-side publish stays
+  loopback (`127.0.0.1:port:port`).
 
 The current Gateway source does not consume the `JWT_*`, Redis, or Postgres values listed under the Gateway heading in `.env.example`. They are not current Gateway API configuration.
 

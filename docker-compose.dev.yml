@@ -5,6 +5,7 @@ services:
   gateway:
     environment:
       - NODE_ENV=development
+      - GATEWAY_HOST=0.0.0.0
     volumes:
       - ./services/gateway:/usr/src/app
       - /usr/src/app/node_modules
@@ -16,6 +17,7 @@ services:
   orchestrator:
     environment:
       - NODE_ENV=development
+      - ORCHESTRATOR_HOST=0.0.0.0
     volumes:
       - ./services/orchestrator:/usr/src/app
       - /usr/src/app/node_modules

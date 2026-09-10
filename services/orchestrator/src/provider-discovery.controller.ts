@@ -1,4 +1,4 @@
-import { Body, Controller, HttpException, HttpStatus, Post } from "@nestjs/common";
+import { Body, Controller, Get, HttpException, HttpStatus, Post, Query } from "@nestjs/common";
 import { ProviderDiscoveryService } from "./services/provider-discovery.service";
 import { WorkbenchCommandService } from "./services/workbench-command.service";
 import { RuntimeConnectionError } from "./services/runtime-connection.service";
@@ -36,6 +36,7 @@ export class ProviderDiscoveryController {
         code === "INVALID_MODEL_ID" ||
         code === "INVALID_OAUTH_URL" ||
         code === "INVALID_METHOD_INDEX" ||
+        code === "AUTH_METHOD_INVALID" ||
         code === "AUTH_METHOD_UNSUPPORTED" ||
         code === "AUTH_METHOD_NOT_OAUTH" ||
         code === "PROVIDER_NOT_AUTHENTICATED" ||
@@ -43,6 +44,7 @@ export class ProviderDiscoveryController {
         code === "AUTH_FLOW_EXPIRED" ||
         code === "AUTH_FLOW_LIMIT" ||
         code === "AUTH_FLOW_CONFLICT" ||
+        code === "AUTH_FLOW_STALE" ||
         code === "OPENCODE_SERVER_FAILED"
       ) {
         throw new HttpException({ success: false, error: { code, message } }, HttpStatus.UNPROCESSABLE_ENTITY);
@@ -90,6 +92,24 @@ export class ProviderDiscoveryController {
     });
   }
 
+  /** Post-PP1 hardening: bounded browser-reload resume read. Returns the
+   *  active unexpired auth flow(s) for a connection (optionally one
+   *  provider) — authFlowId, method identity, authorization URL,
+   *  instructions, expiry. NEVER the management-server password/token. */
+  @Get("auth-flows/active")
+  async activeAuthFlow(
+    @Query("connectionId") connectionId?: string,
+    @Query("providerId") providerId?: string,
+  ) {
+    return this.withMapping(async () => {
+      const data = await this.discovery.getActiveAuthFlows(
+        (connectionId ?? "").slice(0, 255),
+        providerId ? providerId.slice(0, 255) : undefined,
+      );
+      return { success: true, data };
+    });
+  }
+
   @Post("commands/test-target")
   async testTarget(
     @Body() body: { idempotencyKey: string; connectionId: string; modelId: string },
@@ -112,6 +132,8 @@ export class ProviderDiscoveryController {
       connectionId: string;
       providerId: string;
       methodIndex: number;
+      expectedMethodType?: "oauth" | "api";
+      expectedMethodLabel?: string;
     },
   ) {
     return this.withMapping(async () => {
@@ -120,6 +142,12 @@ export class ProviderDiscoveryController {
         connectionId: body.connectionId,
         providerId: body.providerId,
         methodIndex: body.methodIndex,
+        ...(body.expectedMethodType !== undefined
+          ? { expectedMethodType: body.expectedMethodType }
+          : {}),
+        ...(body.expectedMethodLabel !== undefined
+          ? { expectedMethodLabel: body.expectedMethodLabel }
+          : {}),
       });
       return { success: true, data };
     });

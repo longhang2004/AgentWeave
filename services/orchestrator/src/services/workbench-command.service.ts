@@ -15,7 +15,11 @@ import { RuntimeConnectionService } from "./runtime-connection.service";
 import { WorkspaceService } from "./workspace.service";
 import { ModelSourceService } from "./model-source.service";
 import { ProviderDiscoveryService } from "./provider-discovery.service";
-import { WorkspaceExecutionService } from "./workspace-execution.service";
+import {
+  RELEASE_PROCESS_INSTANCE_ID,
+  WorkspaceExecutionService,
+  type ReleaseClaimEvidence,
+} from "./workspace-execution.service";
 import { WorkspaceExecutionError } from "../domain/workspace-execution";
 import { HandoffService } from "./handoff.service";
 import { handoffBundleHash } from "../domain/handoff";
@@ -50,9 +54,48 @@ import { buildRuntimeConnectionProfile } from "../executors/runtime-profiles";
  * directly. Initial actor is the single local operator.
  */
 
-export const PROCESS_INSTANCE_ID = randomUUID();
+export const PROCESS_INSTANCE_ID = RELEASE_PROCESS_INSTANCE_ID;
 export function getProcessInstanceId(): string {
   return PROCESS_INSTANCE_ID;
+}
+
+/**
+ * Post-PP1 hardening: guided-reconnect connection id allocation.
+ * ANY existing row at a candidate id is skipped (regardless of its status
+ * or runtime kind — a live row must never be resurrected or overwritten);
+ * the first ABSENT `conn:<kind>-N` candidate (N in 2..99) wins. When the
+ * bounded suffixes are exhausted, collision-checked random suffixes are
+ * tried — never one unchecked Date.now() attempt. Pure: the taken set is
+ * never mutated, so old rows are unchanged by construction.
+ */
+export function allocateReconnectConnectionId(
+  taken: Iterable<string>,
+  kind: string,
+  randomSuffix: () => string,
+): string {
+  const takenSet = new Set(taken);
+  for (let i = 2; i < 100; i++) {
+    const candidate = `conn:${kind}-${i}`;
+    if (!takenSet.has(candidate)) return candidate;
+  }
+  // ponytail: 8 collision-checked random attempts is far beyond any real
+  // operator's suffix exhaustion; upgrade path is a DB unique-violation retry.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = `conn:${kind}-${randomSuffix()}`;
+    if (!takenSet.has(candidate)) return candidate;
+  }
+  throw new Error(
+    `no free reconnect connection id for "${kind}" — choose an explicit connection id`,
+  );
+}
+
+// Process-scoped active-token registry singleton
+const activeReleaseTokensSingleton = new Set<string>();
+export function getActiveReleaseTokens(): Set<string> {
+  return activeReleaseTokensSingleton;
+}
+export function clearActiveReleaseTokens(): void {
+  activeReleaseTokensSingleton.clear();
 }
 
 export const COMMAND_BOUNDS = {
@@ -146,6 +189,24 @@ export class WorkbenchCommandService {
   private readonly providerDiscovery: ProviderDiscoveryService;
   private readonly workspaceExecutions: WorkspaceExecutionService;
   private readonly handoffs: HandoffService;
+
+  // In-process exact active-release-claim registry keyed by operationId + ownerToken - process-scoped singleton
+  // While a release/recovery invocation is genuinely executing, its exact token is registered as ACTIVE
+  // In finally, the exact token is removed before the invocation exits
+  // Same-process EXECUTING is LIVE only when exact token is still active; otherwise it's a local orphan/recovery candidate
+  // Module-level ensures all WorkbenchCommandService instances in one process share truth (tests construct multiple instances)
+  private activeTokenKey(operationId: string, ownerToken: string): string {
+    return `${operationId}:${ownerToken}`;
+  }
+  private registerActiveToken(operationId: string, ownerToken: string): void {
+    getActiveReleaseTokens().add(this.activeTokenKey(operationId, ownerToken));
+  }
+  private unregisterActiveToken(operationId: string, ownerToken: string): void {
+    getActiveReleaseTokens().delete(this.activeTokenKey(operationId, ownerToken));
+  }
+  private isActiveToken(operationId: string, ownerToken: string): boolean {
+    return getActiveReleaseTokens().has(this.activeTokenKey(operationId, ownerToken));
+  }
 
   private boundedKey(idempotencyKey: string): string {
     if (
@@ -773,25 +834,125 @@ export class WorkbenchCommandService {
     }
 
     // Target-level active release check: at most one ACTIVE release per workspaceExecutionId.
+    // SINGLE DRIVER: stale recovery is reachable without knowing old UUID — any new request that observes a stale owner triggers its takeover.
     const { WorkspaceExecutionEntity } = await import("../entities/workspace-execution.entity");
     const leaseRow0 = await this.dataSource.getRepository(WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+    if (leaseRow0?.state === "REMOVED") {
+      // Legacy/inconsistent: Workspace REMOVED but A still pending → repair A without Git via target-scoped recovery
+      // Find the known prior pending A (if any) before deciding B's provenance — must do before any bulk update
+      const knownPendingA = await this.dataSource.getRepository(OperatorActionEntity).createQueryBuilder("a").where("a.action = :action", { action }).andWhere("a.targetId = :targetId", { targetId }).andWhere("a.id != :id", { id: auditRow.id }).andWhere("(a.outcome->>'pending')::boolean = true").orderBy("a.createdAt", "ASC").getOne();
+      if (knownPendingA) {
+        // Repair A without Git (proven legacy: Workspace already REMOVED, no active ownership)
+        try {
+          await this.dataSource.getRepository(OperatorActionEntity).update({ id: knownPendingA.id }, { outcome: { workspaceExecutionId: targetId, state: "REMOVED" } });
+        } catch {}
+        // Also repair any other pending for this REMOVED workspace (should be at most one, but be safe)
+        const otherPendings = await this.dataSource.getRepository(OperatorActionEntity).createQueryBuilder("a").where("a.action = :action", { action }).andWhere("a.targetId = :targetId", { targetId }).andWhere("a.id NOT IN (:...ids)", { ids: [auditRow.id, knownPendingA.id] }).andWhere("(a.outcome->>'pending')::boolean = true").getMany();
+        for (const pending of otherPendings) {
+          try {
+            await this.dataSource.getRepository(OperatorActionEntity).update({ id: pending.id }, { outcome: { workspaceExecutionId: targetId, state: "REMOVED" } });
+          } catch {}
+        }
+        // B is observer, not executor
+        const observed = await this.observeRecoveredRelease(auditRow.id, key, knownPendingA.id, targetId);
+        if (observed) return observed;
+        const duplicateResult: Record<string, unknown> = { workspaceExecutionId: targetId, state: "REMOVED", performedByOperationId: knownPendingA.id };
+        await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: duplicateResult });
+        return { action, idempotencyKey: key, outcome: "duplicate", result: duplicateResult };
+      }
+      const ownOutcome = auditRow.outcome as any;
+      if (ownOutcome?.pending === true) {
+        const ownTerminal: Record<string, unknown> = { workspaceExecutionId: targetId, state: "REMOVED" };
+        await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: ownTerminal });
+        return { action, idempotencyKey: key, outcome: "duplicate", result: ownTerminal };
+      }
+      const recoveredResult: Record<string, unknown> = {
+        workspaceExecutionId: targetId,
+        state: "REMOVED",
+        performedByOperationId: auditRow.id,
+      };
+      await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: recoveredResult });
+      return {
+        action,
+        idempotencyKey: key,
+        outcome: "duplicate",
+        result: recoveredResult,
+      };
+    }
     if (leaseRow0 && (leaseRow0 as unknown as { state: string }).state === "RELEASE_REQUESTED") {
       const ownerOp = (leaseRow0 as unknown as { releaseOperationId?: string | null }).releaseOperationId;
       if (ownerOp && ownerOp !== auditRow.id) {
+        // Check if owner is stale (previous process EXECUTING) or same-pid pending that failed finalization (worktree already absent)
+        let isStale = false;
+        let isSamePidRecoverable = false;
+        try {
+          const ownerAction = await this.dataSource.getRepository(OperatorActionEntity).findOne({ where: { id: ownerOp } as unknown as Record<string, unknown> });
+          const ownerOutcome = ownerAction?.outcome as Record<string, unknown> | undefined;
+          const ownerPid = (ownerOutcome as { ownerProcessId?: string } | undefined)?.ownerProcessId;
+          const ownerPhase = (ownerOutcome as { phase?: string } | undefined)?.phase;
+          const isRecoverableMarker = Boolean((ownerOutcome as any)?.recoverable === true);
+          const ownerToken = (ownerOutcome as any)?.ownerToken as string | undefined;
+          const isActive = ownerToken ? this.isActiveToken(ownerOp, ownerToken) : false;
+          isStale = Boolean(ownerOutcome && ownerOutcome.pending === true && ownerPhase === "EXECUTING" && ownerPid !== PROCESS_INSTANCE_ID);
+          // Same-process orphan: recoverable marker OR exact token NOT active (covers marker-write-failure)
+          isSamePidRecoverable = Boolean(
+            ownerOutcome &&
+              ownerOutcome.pending === true &&
+              ((ownerPhase === "EXECUTING" && ownerPid === PROCESS_INSTANCE_ID && (isRecoverableMarker || !isActive)) ||
+                (ownerPhase === "REQUESTED" && isRecoverableMarker)),
+          );
+          if (isSamePidRecoverable) {
+            isStale = true;
+          } else if (ownerOutcome && ownerOutcome.pending === true && ownerPhase === "EXECUTING" && ownerPid === PROCESS_INSTANCE_ID && !isRecoverableMarker && isActive) {
+            // Live owner with active exact token → check legacy ABSENT case (conservative, but active token is authoritative)
+            const { worktreeIsRegistered } = await import("./workspace-execution.service");
+            const reg = worktreeIsRegistered((leaseRow0 as any).sourcePath, (leaseRow0 as any).executionPath);
+            if (reg === "ABSENT") {
+              // Even if ABSENT, if token is still active, it's genuinely live (blocked before Git vs after Git distinction is handled in tryRecoverStaleOperation's re-observation)
+              // Do not treat as recoverable here; let the live barrier hold
+            }
+          }
+        } catch {}
+        if (isStale || isSamePidRecoverable) {
+          await this.tryRecoverStaleOperation(ownerOp).catch(() => {});
+          const observed = await this.observeRecoveredRelease(
+            auditRow.id,
+            key,
+            ownerOp,
+            targetId,
+          );
+          if (observed) return observed;
+        }
+        const inProgressOutcome: Record<string, unknown> = {
+          workspaceExecutionId: targetId,
+          state: "IN_PROGRESS",
+          failureCode: "RELEASE_IN_PROGRESS",
+          error: `Execution workspace "${input.workspaceExecutionId}" release is already in progress by operation ${ownerOp}`,
+          ...(isStale ? { triggeredRecovery: ownerOp } : {}),
+        };
+        await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: inProgressOutcome });
         throw new WorkspaceExecutionError(
           "RELEASE_IN_PROGRESS",
           `Execution workspace "${input.workspaceExecutionId}" release is already in progress by operation ${ownerOp}`,
         );
       }
       if (!ownerOp) {
+        const unauthorizedOutcome: Record<string, unknown> = {
+          workspaceExecutionId: targetId,
+          state: "PRESERVED",
+          failureCode: "RELEASE_UNAUTHORIZED",
+          error: `Execution workspace "${input.workspaceExecutionId}" RELEASE_REQUESTED has no authorizing operation`,
+          refusal: true,
+        };
+        await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: unauthorizedOutcome });
         throw new WorkspaceExecutionError(
           "RELEASE_UNAUTHORIZED",
           `Execution workspace "${input.workspaceExecutionId}" RELEASE_REQUESTED has no authorizing operation`,
         );
       }
     }
-    // 2) Check for any other EXECUTING (same PROCESS_INSTANCE_ID) targeting the same workspace.
-    const activeForTarget = await this.dataSource
+    // 2) Check for any other EXECUTING (same PROCESS_INSTANCE_ID) targeting the same workspace (live owner) — only if exact token is still active
+    const activeForTargetAll = await this.dataSource
       .getRepository(OperatorActionEntity)
       .createQueryBuilder("a")
       .where("a.action = :action", { action })
@@ -801,8 +962,18 @@ export class WorkbenchCommandService {
       .andWhere("a.outcome->>'phase' = 'EXECUTING'")
       .andWhere("a.outcome->>'ownerProcessId' = :pid", { pid: PROCESS_INSTANCE_ID })
       .getMany();
-    // console.log(`activeForTarget ${targetId} current ${auditRow.id} found ${activeForTarget.length} other EXECUTING same pid`);
+    const activeForTarget = activeForTargetAll.filter((row) => {
+      const out = row.outcome as any;
+      return out?.ownerToken && this.isActiveToken(row.id, out.ownerToken);
+    });
     if (activeForTarget.length > 0) {
+      const inProgressOutcome: Record<string, unknown> = {
+        workspaceExecutionId: targetId,
+        state: "IN_PROGRESS",
+        failureCode: "RELEASE_IN_PROGRESS",
+        error: `Execution workspace "${input.workspaceExecutionId}" release is already in progress`,
+      };
+      await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: inProgressOutcome });
       throw new WorkspaceExecutionError(
         "RELEASE_IN_PROGRESS",
         `Execution workspace "${input.workspaceExecutionId}" release is already in progress`,
@@ -812,13 +983,97 @@ export class WorkbenchCommandService {
       const otherOutcome = other.outcome as Record<string, unknown> | undefined;
       const otherPid = (otherOutcome as { ownerProcessId?: string } | undefined)?.ownerProcessId;
       if (otherPid === PROCESS_INSTANCE_ID) {
+        const inProgressOutcome: Record<string, unknown> = {
+          workspaceExecutionId: targetId,
+          state: "IN_PROGRESS",
+          failureCode: "RELEASE_IN_PROGRESS",
+          error: `Execution workspace "${input.workspaceExecutionId}" release is already in progress`,
+        };
+        await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: inProgressOutcome });
         throw new WorkspaceExecutionError(
           "RELEASE_IN_PROGRESS",
           `Execution workspace "${input.workspaceExecutionId}" release is already in progress`,
         );
       }
     }
-
+    // Also check for stale EXECUTING owned by different process targeting same workspace but lease not yet RELEASE_REQUESTED (crash before target claim)
+    const stalePendingForTarget = await this.dataSource
+      .getRepository(OperatorActionEntity)
+      .createQueryBuilder("a")
+      .where("a.action = :action", { action })
+      .andWhere("a.targetId = :targetId", { targetId })
+      .andWhere("a.id != :id", { id: auditRow.id })
+      .andWhere("(a.outcome->>'pending')::boolean = true")
+      .andWhere("a.outcome->>'phase' = 'EXECUTING'")
+      .andWhere("a.outcome->>'ownerProcessId' != :pid", { pid: PROCESS_INSTANCE_ID })
+      .getMany();
+    for (const stale of stalePendingForTarget) {
+      await this.tryRecoverStaleOperation(stale.id).catch(() => {});
+      const observed = await this.observeRecoveredRelease(
+        auditRow.id,
+        key,
+        stale.id,
+        targetId,
+      );
+      if (observed) return observed;
+      // B still must not silently replace A's authority; finalize B as IN_PROGRESS after triggering recovery
+      const inProgressOutcome: Record<string, unknown> = {
+        workspaceExecutionId: targetId,
+        state: "IN_PROGRESS",
+        failureCode: "RELEASE_IN_PROGRESS",
+        error: `Execution workspace "${input.workspaceExecutionId}" release is already in progress (stale owner ${stale.id} recovery triggered)`,
+        triggeredRecovery: stale.id,
+      };
+      await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: inProgressOutcome });
+      throw new WorkspaceExecutionError(
+        "RELEASE_IN_PROGRESS",
+        `Execution workspace "${input.workspaceExecutionId}" release is already in progress (recovery of ${stale.id} triggered)`,
+      );
+    }
+    // NEW: pending REQUESTED (including recoverable from failed terminal) for same target must be recovered, not abandoned — B observes A, CAS claims A, Git remains A
+    const pendingRequestedForTarget = await this.dataSource
+      .getRepository(OperatorActionEntity)
+      .createQueryBuilder("a")
+      .where("a.action = :action", { action })
+      .andWhere("a.targetId = :targetId", { targetId })
+      .andWhere("a.id != :id", { id: auditRow.id })
+      .andWhere("(a.outcome->>'pending')::boolean = true")
+      .andWhere("(a.outcome->>'phase' = 'REQUESTED' OR (a.outcome->>'phase' = 'EXECUTING' AND (a.outcome->>'recoverable')::boolean = true) OR a.outcome->>'recoverable' = 'true')")
+      .orderBy("a.createdAt", "ASC")
+      .getMany();
+    // Also include explicit recoverable EXECUTING with same pid that failed terminal persistence
+    const recoverableSamePid = await this.dataSource
+      .getRepository(OperatorActionEntity)
+      .createQueryBuilder("a")
+      .where("a.action = :action", { action })
+      .andWhere("a.targetId = :targetId", { targetId })
+      .andWhere("a.id != :id", { id: auditRow.id })
+      .andWhere("(a.outcome->>'pending')::boolean = true")
+      .andWhere("a.outcome->>'phase' = 'EXECUTING'")
+      .andWhere("(a.outcome->>'recoverable')::boolean = true")
+      .getMany();
+    const allRecoverable = [...pendingRequestedForTarget, ...recoverableSamePid].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    for (const pending of allRecoverable) {
+      const targetLease = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+      const targetState = (targetLease as any)?.state as string | undefined;
+      // Recoverable may be for RELEASE_REQUESTED (failed terminal) as well as PRESERVED/FAILED (crash before claim)
+      if (targetState !== "PRESERVED" && targetState !== "FAILED" && targetState !== "RELEASE_REQUESTED") continue;
+      await this.tryRecoverStaleOperation(pending.id).catch(() => {});
+      const observed = await this.observeRecoveredRelease(auditRow.id, key, pending.id, targetId);
+      if (observed) return observed;
+      const inProgressOutcome: Record<string, unknown> = {
+        workspaceExecutionId: targetId,
+        state: "IN_PROGRESS",
+        failureCode: "RELEASE_IN_PROGRESS",
+        error: `Execution workspace "${input.workspaceExecutionId}" release is already pending by operation ${pending.id} (recovery triggered)`,
+        triggeredRecovery: pending.id,
+      };
+      await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: inProgressOutcome });
+      throw new WorkspaceExecutionError(
+        "RELEASE_IN_PROGRESS",
+        `Execution workspace "${input.workspaceExecutionId}" release is already pending by operation ${pending.id}`,
+      );
+    }
     // Step 1.5: Idempotent durable execution ownership — at most one
     // caller drives the external Git mutation for this (action, key).
     // Uses processInstanceId to distinguish active owner vs dead process.
@@ -826,6 +1081,9 @@ export class WorkbenchCommandService {
     // ownership; other concurrent callers in the SAME process observe IN_PROGRESS and never run Git.
     // A stale EXECUTING from a previous dead process (different ownerProcessId) may be taken over via CAS.
     const claimed = await this.claimReleaseOwnership(auditRow.id, auditRow.outcome as Record<string, unknown> | undefined);
+    if (claimed.claimed) {
+      this.registerActiveToken(auditRow.id, claimed.evidence.ownerToken);
+    }
     if (!claimed.claimed) {
       const authoritative = await this.waitForReleaseFinalOutcome(auditRow.id, key, action);
       const aState = authoritative.state as string | undefined;
@@ -863,21 +1121,20 @@ export class WorkbenchCommandService {
       );
     }
 
-    // Step 2: Execute safe release saga (we are the owner) — pass exact operationId for correlation
-    // eslint-disable-next-line no-restricted-syntax -- bounded safe release controls its own catch per invariant
+    // Step 2: Execute safe release saga (we are the owner) — ONE authoritative terminal transaction after Git (inside WorkspaceExecutionService)
+    // The exact token is registered as ACTIVE while genuinely executing; in finally it is removed before exit so failure leaves it as orphan/recoverable
+    let releaseSucceeded = false;
     try {
       const released =
         await this.workspaceExecutions.releaseExecutionWorkspace(
           input.workspaceExecutionId,
-          auditRow.id,
+          claimed.evidence,
         );
       const result: Record<string, unknown> = {
         workspaceExecutionId: released.id,
         state: released.state,
       };
-      await this.dataSource
-        .getRepository(OperatorActionEntity)
-        .update({ id: auditRow.id }, { outcome: result });
+      releaseSucceeded = true;
       return {
         action,
         idempotencyKey: key,
@@ -886,17 +1143,53 @@ export class WorkbenchCommandService {
       };
     } catch (error) {
       if (error instanceof WorkspaceExecutionError) {
-        // H1/PP1 FINAL audit truth: read actual durable workspace state, never hardcode IN_USE etc
         const code = error.code;
+        // For LEASE_NOT_FOUND and other early failures where no workspace exists, the single transaction was never attempted, so we need to persist the truthful outcome directly
+        if (code === "LEASE_NOT_FOUND" || code === "LEASE_NOT_RELEASABLE" || code === "SHARED_MODE_NO_REMOVAL" || code === "LEASE_PATH_MISSING") {
+          const truthful = await this.truthfulReleaseRefusalOutcome(input.workspaceExecutionId, code, error.message);
+          await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: truthful });
+          throw new WorkspaceExecutionError(truthful.failureCode as string, truthful.error as string);
+        }
+        // For other refusals (like WORKTREE_STATE_UNKNOWN, WORKTREE_DIRTY, etc.), the terminal persistence already happened inside WorkspaceExecutionService if it succeeded
+        // If it rolled back, the Operator is still pending, so keep it pending for recovery
+        const currentOp = await this.dataSource.getRepository(OperatorActionEntity).findOne({ where: { id: auditRow.id } });
+        const curOutcome = currentOp?.outcome as any;
+        if (curOutcome?.pending === true) {
+          throw error;
+        }
         const truthful = await this.truthfulReleaseRefusalOutcome(
           input.workspaceExecutionId,
           code,
           error.message,
         );
-        await this.dataSource
-          .getRepository(OperatorActionEntity)
-          .update({ id: auditRow.id }, { outcome: truthful });
         throw new WorkspaceExecutionError(truthful.failureCode as string, truthful.error as string);
+      }
+       // ANY terminal persistence failure after Git (injected or real DB failure) must remain recoverable
+      // Classify based on durable post-error state, not error string: re-read Workspace, lock, Operator
+      const wsAfter = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+      const lockAfter = await this.dataSource.query(`SELECT "releaseOperationId" FROM "workspace_release_locks" WHERE "workspaceExecutionId" = $1`, [targetId]);
+      const lockOpAfter = Array.isArray(lockAfter) ? lockAfter[0]?.releaseOperationId : lockAfter?.rows?.[0]?.releaseOperationId;
+      const opAfter = await this.dataSource.getRepository(OperatorActionEntity).findOne({ where: { id: auditRow.id } });
+      const opOutAfter = opAfter?.outcome as any;
+      const stillOwnsTarget = wsAfter?.releaseOperationId === auditRow.id && lockOpAfter === auditRow.id && opOutAfter?.pending === true;
+      if (stillOwnsTarget) {
+        // Terminal commit did not happen → CAS A to explicit recoverable pending state before returning, so same-pid is distinguishable from live owner
+        // Use REQUESTED with recoverable marker (explicit durable retryable state, not timing/TTL)
+        try {
+          await this.dataSource.getRepository(OperatorActionEntity).createQueryBuilder().update(OperatorActionEntity).set({ outcome: { pending: true, phase: "REQUESTED", recoverable: true, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: opOutAfter.ownerToken, claimedAt: opOutAfter.claimedAt, failedTerminal: true } as any }).where("id = :id", { id: auditRow.id }).andWhere("outcome->>'phase' = 'EXECUTING'").execute();
+        } catch {}
+        throw error;
+      }
+      // If terminal already committed (workspace REMOVED/PRESERVED with new state, lock gone, operator terminal), observe truth
+      if (wsAfter?.state === "REMOVED" || wsAfter?.state === "PRESERVED") {
+        const truth = await this.readRecoveredReleaseTruth(auditRow.id, targetId);
+        if (truth && truth.state !== "IN_PROGRESS") {
+          await this.dataSource.getRepository(OperatorActionEntity).update({ id: auditRow.id }, { outcome: truth });
+          if (truth.state === "REMOVED") {
+            return { action, idempotencyKey: key, outcome: "executed", result: truth } as any;
+          }
+          throw new WorkspaceExecutionError((truth.failureCode as any) ?? "RELEASE_NOT_COMPLETED", (truth.error as any) ?? "Release completed");
+        }
       }
       // Non-WorkspaceExecutionError: mark INTERRUPTED with truthful evidence
       // so a retry can re-enter and recover (no ambiguous pending forever).
@@ -911,6 +1204,31 @@ export class WorkbenchCommandService {
         .getRepository(OperatorActionEntity)
         .update({ id: auditRow.id }, { outcome: interrupted });
       throw error;
+    } finally {
+      // Always unregister the exact token when this invocation exits, so a later fresh UUID can distinguish live vs orphan
+      // Check affected count for the recoverable transition and do not swallow failure — in-process registry still makes it distinguishable
+      try {
+        this.unregisterActiveToken(auditRow.id, claimed.evidence.ownerToken);
+      } catch {}
+      // Also attempt durable recoverable transition if stillOwnsTarget and we had a terminal failure (best-effort, check affected)
+      // This is the explicit retryable marker; if this DB write fails, the in-process registry being empty still makes it recoverable
+      if (!releaseSucceeded) {
+        try {
+          const wsAfter2 = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+          const lockAfter2 = await this.dataSource.query(`SELECT "releaseOperationId" FROM "workspace_release_locks" WHERE "workspaceExecutionId" = $1`, [targetId]);
+          const lockOpAfter2 = Array.isArray(lockAfter2) ? lockAfter2[0]?.releaseOperationId : lockAfter2?.rows?.[0]?.releaseOperationId;
+          const opAfter2 = await this.dataSource.getRepository(OperatorActionEntity).findOne({ where: { id: auditRow.id } });
+          const opOutAfter2 = opAfter2?.outcome as any;
+          const stillOwns2 = wsAfter2?.releaseOperationId === auditRow.id && lockOpAfter2 === auditRow.id && opOutAfter2?.pending === true && opOutAfter2?.phase === "EXECUTING";
+          if (stillOwns2) {
+            const res = await this.dataSource.getRepository(OperatorActionEntity).createQueryBuilder().update(OperatorActionEntity).set({ outcome: { pending: true, phase: "REQUESTED", recoverable: true, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: opOutAfter2.ownerToken, claimedAt: opOutAfter2.claimedAt, failedTerminal: true } as any }).where("id = :id", { id: auditRow.id }).andWhere("outcome->>'phase' = 'EXECUTING'").execute();
+            // Check affected count — if 0, the in-process registry being empty is still sufficient for recovery
+            if ((res.affected ?? 0) === 0) {
+              // Marker write failed, but active token is now unregistered, so same-pid will be considered orphan
+            }
+          }
+        } catch {}
+      }
     }
   }
 
@@ -941,7 +1259,27 @@ export class WorkbenchCommandService {
         `"${input.runtimeKind}" was not detected on PATH; install the official CLI first`,
       );
     }
-    const connectionId = input.connectionId ?? `conn:${input.runtimeKind}`;
+    let connectionId = input.connectionId ?? `conn:${input.runtimeKind}`;
+    // P1: reconnect after terminal revocation - never resurrect revoked row, create new identity.
+    // Post-PP1 hardening: guided reconnect scans candidates ONLY when the
+    // default id is REVOKED; ANY existing row at a candidate id is skipped
+    // (regardless of status/runtime kind); the first ABSENT candidate wins;
+    // exhausted bounded suffixes fall through to collision-checked random
+    // suffixes — never one unchecked Date.now() attempt.
+    if (!input.connectionId) {
+      const repo = this.dataSource.getRepository(
+        (await import("../entities/runtime-connection.entity")).RuntimeConnectionEntity,
+      );
+      const rows = await repo.find({ select: { connectionId: true, statusState: true } as any });
+      const statusById = new Map(rows.map((row) => [row.connectionId, row.statusState]));
+      if (statusById.get(connectionId) === "REVOKED") {
+        connectionId = allocateReconnectConnectionId(
+          statusById.keys(),
+          input.runtimeKind,
+          () => randomUUID().replace(/-/g, "").slice(0, 6),
+        );
+      }
+    }
     const created = await this.createConnection({
       idempotencyKey: `${input.idempotencyKey}:create`,
       connectionId,
@@ -1259,16 +1597,22 @@ export class WorkbenchCommandService {
     );
   }
 
-  /** OpenCode OAuth: BEGIN the runtime-owned auth flow. Resolves the exact
-   *  connection revision, starts a LIVE management server, validates the
-   *  methodIndex against the fresh auth-method snapshot, performs POST
-   *  authorize — and RETAINS the same live session for the completion
-   *  step (OpenCode pending state is instance-local). Audited. */
+  /** OpenCode OAuth: BEGIN the runtime-owned auth flow. Idempotent BEFORE
+   *  external side effects: an existing compatible flow is returned
+   *  directly (same authFlowId/URL, zero new session, zero authorize) and
+   *  an incompatible one fails closed with AUTH_FLOW_CONFLICT. A fresh
+   *  flow resolves the exact connection revision, starts a LIVE management
+   *  server, validates the methodIndex AND the expected method fingerprint
+   *  against the fresh auth-method snapshot, performs POST authorize — and
+   *  RETAINS the same live session for the completion step (OpenCode
+   *  pending state is instance-local). Audited. */
   async openCodeOauthBegin(input: {
     idempotencyKey: string;
     connectionId: string;
     providerId: string;
     methodIndex: number;
+    expectedMethodType?: "oauth" | "api";
+    expectedMethodLabel?: string;
   }): Promise<CommandResult> {
     const connectionId = input.connectionId.slice(0, 255);
     const providerId = input.providerId.slice(0, 255);
@@ -1283,6 +1627,12 @@ export class WorkbenchCommandService {
           connectionId,
           providerId,
           methodIndex,
+          ...(input.expectedMethodType !== undefined
+            ? { expectedMethodType: input.expectedMethodType }
+            : {}),
+          ...(input.expectedMethodLabel !== undefined
+            ? { expectedMethodLabel: input.expectedMethodLabel }
+            : {}),
         });
         return {
           authFlowId: flow.authFlowId,
@@ -1292,6 +1642,7 @@ export class WorkbenchCommandService {
           connectionId: flow.connectionId,
           connectionRevision: flow.connectionRevision,
           providerId: flow.providerId,
+          resumed: flow.resumed,
         };
       },
     );
@@ -1325,12 +1676,16 @@ export class WorkbenchCommandService {
   private async claimReleaseOwnership(
     auditRowId: string,
     outcome: Record<string, unknown> | undefined,
-  ): Promise<{ claimed: boolean }> {
+  ): Promise<
+    | { claimed: false }
+    | { claimed: true; evidence: ReleaseClaimEvidence }
+  > {
     const phase = (outcome as { phase?: string } | undefined)?.phase;
     const ownerProcessId = (outcome as { ownerProcessId?: string } | undefined)?.ownerProcessId;
+    const ownerToken = (outcome as { ownerToken?: string } | undefined)?.ownerToken;
     const repo = this.dataSource.getRepository(OperatorActionEntity);
     if (outcome?.pending === true && phase === "REQUESTED") {
-      const ownerToken = randomUUID();
+      const newToken = randomUUID();
       const result = await repo
         .createQueryBuilder()
         .update(OperatorActionEntity)
@@ -1338,7 +1693,7 @@ export class WorkbenchCommandService {
           outcome: {
             pending: true,
             phase: "EXECUTING",
-            ownerToken,
+            ownerToken: newToken,
             ownerProcessId: PROCESS_INSTANCE_ID,
             claimedAt: new Date().toISOString(),
           } as unknown as Record<string, unknown>,
@@ -1347,13 +1702,60 @@ export class WorkbenchCommandService {
         .andWhere("(outcome->>'pending')::boolean = true")
         .andWhere("outcome->>'phase' = 'REQUESTED'")
         .execute();
-      return { claimed: (result.affected ?? 0) === 1 };
+      return (result.affected ?? 0) === 1
+        ? {
+            claimed: true,
+            evidence: {
+              operationId: auditRowId,
+              ownerProcessId: PROCESS_INSTANCE_ID,
+              ownerToken: newToken,
+            },
+          }
+        : { claimed: false };
     }
     if (outcome?.pending === true && phase === "EXECUTING") {
-      // Active owner in same process → cannot claim
       if (ownerProcessId === PROCESS_INSTANCE_ID) {
-        return { claimed: false };
+        // Same-process EXECUTING is LIVE only when exact old token is still active in-process
+        // If exact token is NOT active, it's a same-process orphan (prior invocation exited, even if recoverable marker write failed) → allow reclaim
+        if (ownerToken && this.isActiveToken(auditRowId, ownerToken)) {
+          return { claimed: false };
+        }
+        // Orphan: allow CAS reclaim to fresh token (preserve provenance, same-process recovery)
+        const newTokenOrphan = randomUUID();
+        const orphanResult = await repo
+          .createQueryBuilder()
+          .update(OperatorActionEntity)
+          .set({
+            outcome: {
+              pending: true,
+              phase: "EXECUTING",
+              ownerToken: newTokenOrphan,
+              ownerProcessId: PROCESS_INSTANCE_ID,
+              claimedAt: new Date().toISOString(),
+              sameProcessRecovery: true,
+              takenOverFrom: ownerProcessId ?? null,
+            } as unknown as Record<string, unknown>,
+          })
+          .where("id = :id", { id: auditRowId })
+          .andWhere("(outcome->>'pending')::boolean = true")
+          .andWhere("outcome->>'phase' = 'EXECUTING'")
+          .andWhere("outcome->>'ownerProcessId' = :oldProcessId", { oldProcessId: ownerProcessId })
+          .andWhere("outcome->>'ownerToken' = :oldOwnerToken", { oldOwnerToken: ownerToken })
+          .execute();
+        return (orphanResult.affected ?? 0) === 1
+          ? {
+              claimed: true,
+              evidence: {
+                operationId: auditRowId,
+                ownerProcessId: PROCESS_INSTANCE_ID,
+                ownerToken: newTokenOrphan,
+              },
+            }
+          : { claimed: false };
       }
+      // An EXECUTING row without an exact old owner identity is not
+      // recoverable authority; do not invent a takeover token.
+      if (!ownerProcessId || !ownerToken) return { claimed: false };
       // Stale owner from previous dead process → explicit takeover via CAS
       const newToken = randomUUID();
       const result = await repo
@@ -1373,34 +1775,270 @@ export class WorkbenchCommandService {
         .andWhere("(outcome->>'pending')::boolean = true")
         .andWhere("outcome->>'phase' = 'EXECUTING'")
         .andWhere("outcome->>'ownerProcessId' = :oldProcessId", {
-          oldProcessId: ownerProcessId ?? "",
+          oldProcessId: ownerProcessId,
+        })
+        .andWhere("outcome->>'ownerToken' = :oldOwnerToken", {
+          oldOwnerToken: ownerToken,
         })
         .execute();
-      if ((result.affected ?? 0) === 1) return { claimed: true };
-      // If old ownerProcessId was null/undefined (legacy), try without that predicate
-      if (!ownerProcessId) {
-        const fallback = await repo
-          .createQueryBuilder()
-          .update(OperatorActionEntity)
-          .set({
-            outcome: {
-              pending: true,
-              phase: "EXECUTING",
-              ownerToken: newToken,
+      return (result.affected ?? 0) === 1
+        ? {
+            claimed: true,
+            evidence: {
+              operationId: auditRowId,
               ownerProcessId: PROCESS_INSTANCE_ID,
-              claimedAt: new Date().toISOString(),
-              takenOverFrom: null,
-            } as unknown as Record<string, unknown>,
-          })
-          .where("id = :id", { id: auditRowId })
-          .andWhere("(outcome->>'pending')::boolean = true")
-          .andWhere("outcome->>'phase' = 'EXECUTING'")
-          .execute();
-        return { claimed: (fallback.affected ?? 0) === 1 };
-      }
-      return { claimed: false };
+              ownerToken: newToken,
+            },
+          }
+        : { claimed: false };
     }
     return { claimed: false };
+  }
+
+  private async readRecoveredReleaseTruth(
+    operationId: string,
+    workspaceExecutionId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const action = await this.dataSource
+      .getRepository(OperatorActionEntity)
+      .findOne({ where: { id: operationId } });
+    const actionOutcome = action?.outcome as Record<string, unknown> | undefined;
+    const { WorkspaceExecutionEntity } = await import("../entities/workspace-execution.entity");
+    const lease = await this.dataSource
+      .getRepository(WorkspaceExecutionEntity)
+      .findOne({ where: { id: workspaceExecutionId } });
+
+    let truth: Record<string, unknown> | null = null;
+    if (lease?.state === "REMOVED") {
+      truth = {
+        workspaceExecutionId,
+        state: "REMOVED",
+      };
+    } else if (lease?.state === "PRESERVED" && lease.failureCode) {
+      truth = {
+        workspaceExecutionId,
+        state: "PRESERVED",
+        failureCode: lease.failureCode,
+        hasUncommittedWork: lease.hasUncommittedWork,
+        refusal: true,
+        error: lease.failureCode,
+      };
+    } else if (
+      actionOutcome &&
+      actionOutcome.pending !== true &&
+      ["REMOVED", "PRESERVED", "NOT_FOUND", "INTERRUPTED", "FAILED"].includes(
+        String(actionOutcome.state),
+      )
+    ) {
+      truth = { ...actionOutcome };
+    }
+    if (!truth) return null;
+    return {
+      ...truth,
+      workspaceExecutionId,
+      performedByOperationId: operationId,
+    };
+  }
+
+  /** Observe A after synchronous stale recovery; B never claims or mutates A. */
+  private async observeRecoveredRelease(
+    auditRowId: string,
+    idempotencyKey: string,
+    operationId: string,
+    workspaceExecutionId: string,
+  ): Promise<CommandResult | null> {
+    const truth = await this.readRecoveredReleaseTruth(operationId, workspaceExecutionId);
+    if (!truth || truth.state === "IN_PROGRESS") return null;
+    await this.dataSource
+      .getRepository(OperatorActionEntity)
+      .update({ id: auditRowId }, { outcome: truth });
+    if (truth.state === "REMOVED") {
+      return {
+        action: "release-execution-workspace",
+        idempotencyKey,
+        outcome: "duplicate",
+        result: truth,
+      };
+    }
+    throw new WorkspaceExecutionError(
+      (truth.failureCode as string) ?? "RELEASE_NOT_COMPLETED",
+      (truth.error as string) ?? `Release completed with state ${String(truth.state)}`,
+    );
+  }
+
+  /**
+   * SINGLE release-operation driver for stale recovery: claim/take over the exact stale operation A by CAS and execute Git as A.
+   * Git mutation remains authorized by A, not by B. Exactly one takeover winner via CAS.
+   * Used by normal execution and crash recovery (new UUID frontend reload still converges via this).
+   * For finalization-failure recovery, first re-observe worktree: ABSENT→REMOVED without Git, REGISTERED→Git, UNKNOWN→fail closed.
+   */
+  private async tryRecoverStaleOperation(staleOperationId: string): Promise<boolean> {
+    const repo = this.dataSource.getRepository(OperatorActionEntity);
+    const staleRow = await repo.findOne({ where: { id: staleOperationId } });
+    if (!staleRow) return false;
+    if (staleRow.action !== "release-execution-workspace") return false;
+    const targetId = staleRow.targetId;
+    if (!targetId) return false;
+    const outcome = staleRow.outcome as Record<string, unknown> | undefined;
+    if (!outcome || outcome.pending !== true) return false;
+    const phase = (outcome as { phase?: string }).phase;
+    if (phase !== "REQUESTED" && phase !== "EXECUTING") return false;
+    // If already in explicit recoverable state (same pid, recoverable marker), try to finalize directly without re-claiming
+    const isSamePidRecoverable = (outcome as any).ownerProcessId === PROCESS_INSTANCE_ID && (outcome as any).recoverable === true;
+    if (isSamePidRecoverable) {
+      try {
+        const wsRepo2 = this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity);
+        const lease2 = await wsRepo2.findOne({ where: { id: targetId } as any });
+        if (lease2?.state === "RELEASE_REQUESTED" && (lease2 as any).executionPath) {
+          const { worktreeIsRegistered: wirSame } = await import("./workspace-execution.service");
+          const regSame = wirSame((lease2 as any).sourcePath, (lease2 as any).executionPath);
+          if (regSame === "ABSENT") {
+            const resultSame: Record<string, unknown> = { workspaceExecutionId: targetId, state: "REMOVED" };
+            const fakeClaimSame = { operationId: staleOperationId, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: (outcome as any).ownerToken ?? "recovered" };
+            await this.workspaceExecutions.persistTerminalRelease(targetId, fakeClaimSame as any, { state: "REMOVED" }, resultSame);
+            return true;
+          } else if (regSame === "REGISTERED") {
+            // For refusal/UNKNOWN with REGISTERED, the normal path below will re-observe and handle via Git/refusal
+          }
+        }
+      } catch {}
+      // For recoverable, allow claim to re-drive (will be handled below as REQUESTED)
+      if (phase === "EXECUTING" && (outcome as any).recoverable === true) {
+        // Temporarily treat as REQUESTED for claiming
+        await this.dataSource.getRepository(OperatorActionEntity).update({ id: staleOperationId }, { outcome: { ...outcome, phase: "REQUESTED" } as any });
+        const refreshed = await repo.findOne({ where: { id: staleOperationId } });
+        if (refreshed) {
+          const newOutcome = refreshed.outcome as any;
+          const claimed2 = await this.claimReleaseOwnership(staleOperationId, newOutcome);
+          if (claimed2.claimed) {
+            // Now proceed to normal observation below with the new claim
+            // Fall through to the normal handling with the new claimed evidence
+            // For simplicity, just return false and let the outer pendingRequested path handle it
+            return false;
+          }
+        }
+      }
+    }
+    // Attempt to claim/takeover via single driver CAS
+    const claimed = await this.claimReleaseOwnership(staleOperationId, outcome);
+    if (!claimed.claimed) return false;
+    this.registerActiveToken(staleOperationId, claimed.evidence.ownerToken);
+    let claimedSucceeded = false;
+    // Re-observe worktree before deciding Git: if already REMOVED/absent, finalize without Git (covers crash between Git and finalization, and legacy REMOVED+pending)
+    // For finalization failure, the operation is still pending with same pid, but the worktree is already absent on FS, so we should finalize without Git
+    let reObserveSucceeded = false;
+    try {
+      const { WorkspaceExecutionEntity } = await import("../entities/workspace-execution.entity");
+      const wsRepo = this.dataSource.getRepository(WorkspaceExecutionEntity);
+      const lease = await wsRepo.findOne({ where: { id: targetId } as any });
+      if (lease?.state === "REMOVED") {
+        const result: Record<string, unknown> = { workspaceExecutionId: targetId, state: "REMOVED" };
+        await this.workspaceExecutions.persistTerminalRelease(targetId, claimed.evidence, { state: "REMOVED" }, result);
+        reObserveSucceeded = true;
+        return true;
+      }
+      if (lease && (lease as any).executionPath) {
+        const { worktreeIsRegistered } = await import("./workspace-execution.service");
+        const registration = worktreeIsRegistered((lease as any).sourcePath, (lease as any).executionPath);
+        if (registration === "ABSENT") {
+          const result: Record<string, unknown> = { workspaceExecutionId: targetId, state: "REMOVED" };
+          await this.workspaceExecutions.persistTerminalRelease(targetId, claimed.evidence, { state: "REMOVED" }, result);
+          return true;
+        }
+        // UNKNOWN must NOT short-circuit here; let the canonical Safe Release path persist the truthful PRESERVED/WORKTREE_STATE_UNKNOWN via the single terminal transaction
+      }
+      if (lease?.state === "RELEASE_REQUESTED" && (outcome as any).phase === "EXECUTING" && (lease as any).executionPath) {
+        const { worktreeIsRegistered: wir2 } = await import("./workspace-execution.service");
+        const reg2 = wir2((lease as any).sourcePath, (lease as any).executionPath);
+        if (reg2 === "ABSENT") {
+          const result: Record<string, unknown> = { workspaceExecutionId: targetId, state: "REMOVED" };
+          await this.workspaceExecutions.persistTerminalRelease(targetId, claimed.evidence, { state: "REMOVED" }, result);
+          reObserveSucceeded = true;
+          return true;
+        }
+      }
+    } catch (e) {
+      // If persistTerminalRelease failed while still owning target, CAS to recoverable before returning
+      const wsCheck = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+      const lockCheck = await this.dataSource.query(`SELECT "releaseOperationId" FROM "workspace_release_locks" WHERE "workspaceExecutionId" = $1`, [targetId]);
+      const lockOp = Array.isArray(lockCheck) ? lockCheck[0]?.releaseOperationId : lockCheck?.rows?.[0]?.releaseOperationId;
+      const cur = await repo.findOne({ where: { id: staleOperationId } });
+      const stillOwns = wsCheck?.releaseOperationId === staleOperationId && lockOp === staleOperationId && (cur?.outcome as any)?.pending === true;
+      if (stillOwns) {
+        const curOut = cur?.outcome as any;
+        if (curOut?.phase === "EXECUTING" && curOut?.ownerProcessId === PROCESS_INSTANCE_ID && curOut?.ownerToken === claimed.evidence.ownerToken) {
+          await repo.createQueryBuilder().update(OperatorActionEntity).set({ outcome: { pending: true, phase: "REQUESTED", recoverable: true, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: curOut.ownerToken, claimedAt: curOut.claimedAt, failedFrom: curOut.phase } as any }).where("id = :id", { id: staleOperationId }).andWhere("outcome->>'phase' = 'EXECUTING'").execute().catch(() => {});
+        }
+      }
+      // Even if DB marker write failed, in-process registry being removed in finally will make it recoverable
+      return false;
+    }
+    // We are now the owner of the exact stale operation A — execute Git as A (single terminal transaction inside WorkspaceExecutionService)
+    let gitSucceeded = false;
+    try {
+      const released = await this.workspaceExecutions.releaseExecutionWorkspace(targetId, claimed.evidence);
+      gitSucceeded = true;
+      return true;
+    } catch (error) {
+      if (error instanceof WorkspaceExecutionError) {
+        const wsCheck = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+        const lockCheck = await this.dataSource.query(`SELECT "releaseOperationId" FROM "workspace_release_locks" WHERE "workspaceExecutionId" = $1`, [targetId]);
+        const lockOp = Array.isArray(lockCheck) ? lockCheck[0]?.releaseOperationId : lockCheck?.rows?.[0]?.releaseOperationId;
+        const cur = await repo.findOne({ where: { id: staleOperationId } });
+        const stillOwnsTarget = wsCheck?.releaseOperationId === staleOperationId && lockOp === staleOperationId && (cur?.outcome as any)?.pending === true;
+        if (stillOwnsTarget) {
+          // Authoritative transaction rolled back while A still owns active target → CAS to explicit retryable before return
+          const curOut = cur?.outcome as any;
+          if (curOut?.phase === "EXECUTING" && curOut?.ownerProcessId === PROCESS_INSTANCE_ID && curOut?.ownerToken === claimed.evidence.ownerToken) {
+            await this.dataSource.getRepository(OperatorActionEntity).createQueryBuilder().update(OperatorActionEntity).set({ outcome: { pending: true, phase: "REQUESTED", recoverable: true, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: curOut.ownerToken, claimedAt: curOut.claimedAt, failedFrom: curOut.phase } as any }).where("id = :id", { id: staleOperationId }).andWhere("outcome->>'phase' = 'EXECUTING'").execute().catch(() => {});
+          }
+          return false;
+        }
+        return true;
+      }
+      const wsCheck2 = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+      const lockCheck2 = await this.dataSource.query(`SELECT "releaseOperationId" FROM "workspace_release_locks" WHERE "workspaceExecutionId" = $1`, [targetId]);
+      const lockOp2 = Array.isArray(lockCheck2) ? lockCheck2[0]?.releaseOperationId : lockCheck2?.rows?.[0]?.releaseOperationId;
+      const cur2 = await repo.findOne({ where: { id: staleOperationId } });
+      const stillOwnsTarget2 = wsCheck2?.releaseOperationId === staleOperationId && lockOp2 === staleOperationId && (cur2?.outcome as any)?.pending === true;
+      if (stillOwnsTarget2) {
+        const curOut2 = cur2?.outcome as any;
+        if (curOut2?.phase === "EXECUTING" && curOut2?.ownerProcessId === PROCESS_INSTANCE_ID && curOut2?.ownerToken === claimed.evidence.ownerToken) {
+          await this.dataSource.getRepository(OperatorActionEntity).createQueryBuilder().update(OperatorActionEntity).set({ outcome: { pending: true, phase: "REQUESTED", recoverable: true, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: curOut2.ownerToken, claimedAt: curOut2.claimedAt, failedFrom: curOut2.phase } as any }).where("id = :id", { id: staleOperationId }).andWhere("outcome->>'phase' = 'EXECUTING'").execute().catch(() => {});
+        }
+        return false;
+      }
+      // Terminal already committed or ownership lost → do not mark INTERRUPTED while still owning target
+      if ((cur2?.outcome as any)?.pending === true) {
+        return false;
+      }
+      return true;
+    } finally {
+      // Always unregister exact token when this recovery attempt exits; if marker write failed, the empty registry still makes it recoverable
+      try {
+        this.unregisterActiveToken(staleOperationId, claimed.evidence.ownerToken);
+      } catch {}
+      // If we had claimed but the terminal failed and we are still pending, ensure recoverable marker (check affected)
+      if (!claimedSucceeded) {
+        try {
+          const wsChk = await this.dataSource.getRepository((await import("../entities/workspace-execution.entity")).WorkspaceExecutionEntity).findOne({ where: { id: targetId } as any });
+          const lockChk = await this.dataSource.query(`SELECT "releaseOperationId" FROM "workspace_release_locks" WHERE "workspaceExecutionId" = $1`, [targetId]);
+          const lockOpChk = Array.isArray(lockChk) ? lockChk[0]?.releaseOperationId : lockChk?.rows?.[0]?.releaseOperationId;
+          const curChk = await repo.findOne({ where: { id: staleOperationId } });
+          const stillOwnsChk = wsChk?.releaseOperationId === staleOperationId && lockOpChk === staleOperationId && (curChk?.outcome as any)?.pending === true;
+          if (stillOwnsChk) {
+            const curOutChk = curChk?.outcome as any;
+            if (curOutChk?.phase === "EXECUTING" && curOutChk?.ownerProcessId === PROCESS_INSTANCE_ID && curOutChk?.ownerToken === claimed.evidence.ownerToken) {
+              const resChk = await repo.createQueryBuilder().update(OperatorActionEntity).set({ outcome: { pending: true, phase: "REQUESTED", recoverable: true, ownerProcessId: PROCESS_INSTANCE_ID, ownerToken: curOutChk.ownerToken, claimedAt: curOutChk.claimedAt, failedFrom: curOutChk.phase } as any }).where("id = :id", { id: staleOperationId }).andWhere("outcome->>'phase' = 'EXECUTING'").execute();
+              // Do not swallow failure as if correctness preserved; in-process registry being empty is the fallback
+              if ((resChk.affected ?? 0) === 0) {
+                // Marker write failed, but registry is now empty, so next fresh UUID will see no active token and can recover
+              }
+            }
+          }
+        } catch {}
+      }
+    }
   }
 
   private async waitForReleaseFinalOutcome(

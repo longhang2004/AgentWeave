@@ -6,12 +6,17 @@
  * state: the callback MUST target the same live `opencode serve` instance
  * that performed authorize. The flow owns the session lifecycle:
  *
- *   begin (resolve revision -> start server -> fetch methods -> validate
- *         methodIndex -> POST authorize {method} -> RETAIN session)
+ *   begin (classify existing flow FIRST — compatible reuse / conflict with
+ *         ZERO new server and ZERO authorize — then resolve revision ->
+ *         start server -> fetch methods -> validate methodIndex +
+ *         expected fingerprint -> POST authorize {method} -> RETAIN
+ *         session + stored authorization URL)
  *     -> bounded { authFlowId, url, method: auto|code, instructions }
  *   operator completes provider-owned flow
  *   complete (SAME session -> POST callback {method, code?} -> GET
  *         /provider -> prove connected -> close server -> remove flow)
+ *   resume (browser reload -> bounded read endpoint returns the SAME
+ *         authFlowId/url/instructions from the retained session)
  *
  * Bounds: cryptographically random opaque authFlowId, short TTL, max
  * active flows, one flow per (connection revision, provider), cancel
@@ -35,6 +40,14 @@ export type OpenCodeAuthFlowV1 = {
   connectionRevision: number;
   providerId: string;
   methodIndex: number;
+  /** Exact identity of the authorized method (fingerprint retained so a
+   *  reordered fresh snapshot can never silently reuse this flow). */
+  methodType: "oauth" | "api";
+  methodLabel: string;
+  /** The authorization URL returned by the RETAINED session's authorize —
+   *  a resumed flow returns exactly this URL, never one from a discarded
+   *  session. Bounded, non-secret. */
+  url: string;
   authorizationMethod: "auto" | "code";
   instructions: string | null;
   expiresAt: number;
@@ -53,6 +66,43 @@ export class OpenCodeAuthFlowError extends Error {
   ) {
     super(message);
     this.name = "OpenCodeAuthFlowError";
+  }
+}
+
+/**
+ * Post-PP1 hardening: process-local keyed mutex. Serializes OAuth Begin
+ * per exact target (connectionId + connectionRevision + providerId) so
+ * CONCURRENT duplicate Begins classify-then-authorize exactly once —
+ * no second management session, no second /oauth/authorize, ever.
+ * Chains are FIFO per key; every chain self-removes after release, so
+ * the map never grows with completed targets and never leaks when Begin
+ * throws (release runs in finally).
+ */
+export class BoundedKeyedMutex {
+  private readonly chains = new Map<string, Promise<void>>();
+
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.chains.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chain = previous.then(() => acquired);
+    this.chains.set(key, chain);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      void chain.then(() => {
+        if (this.chains.get(key) === chain) this.chains.delete(key);
+      });
+    }
+  }
+
+  /** Test/observability surface: number of keys with pending chains. */
+  pendingKeys(): number {
+    return this.chains.size;
   }
 }
 
@@ -100,10 +150,79 @@ export class OpenCodeAuthFlowService implements OnModuleDestroy {
   }
 
   /**
+   * Post-PP1 hardening: classify an existing flow for the EXACT target
+   * BEFORE any external side effect (no management session, no authorize).
+   * Compatible = same connectionId + providerId + current connectionRevision
+   * + methodIndex + expected method fingerprint. Same connection/provider
+   * with any other identity is a CONFLICT (fail closed). Everything else
+   * is "none" — the caller may start a fresh flow.
+   */
+  classifyExisting(input: {
+    connectionId: string;
+    connectionRevision: number;
+    providerId: string;
+    methodIndex: number;
+    expectedType?: string;
+    expectedLabel?: string;
+  }):
+    | { kind: "compatible"; flow: OpenCodeAuthFlowV1 }
+    | { kind: "conflict"; message: string }
+    | { kind: "none" } {
+    for (const existing of this.flows.values()) {
+      if (
+        existing.connectionId !== input.connectionId ||
+        existing.providerId !== input.providerId
+      ) {
+        continue;
+      }
+      const sameMethod =
+        existing.methodIndex === input.methodIndex &&
+        existing.connectionRevision === input.connectionRevision &&
+        (input.expectedType === undefined || existing.methodType === input.expectedType) &&
+        (input.expectedLabel === undefined || existing.methodLabel === input.expectedLabel);
+      if (!sameMethod) {
+        return {
+          kind: "conflict",
+          message: `an auth flow for ${input.providerId} on ${input.connectionId} is already active with a different target (revision ${existing.connectionRevision}, method ${existing.methodIndex} "${existing.methodLabel}") — cancel it first`,
+        };
+      }
+      // Compatible active flow: refresh the bounded expiry so an operator
+      // who re-opens the page keeps the SAME retained session alive.
+      clearTimeout(existing.expiryTimer);
+      const newExpiry = setTimeout(() => this.expire(existing.authFlowId), this.ttlMs);
+      newExpiry.unref?.();
+      existing.expiryTimer = newExpiry;
+      existing.expiresAt = Date.now() + this.ttlMs;
+      return { kind: "compatible", flow: this.toBounded(existing) };
+    }
+    return { kind: "none" };
+  }
+
+  private toBounded(flow: LiveFlow): OpenCodeAuthFlowV1 {
+    return {
+      authFlowId: flow.authFlowId,
+      connectionId: flow.connectionId,
+      connectionRevision: flow.connectionRevision,
+      providerId: flow.providerId,
+      methodIndex: flow.methodIndex,
+      methodType: flow.methodType,
+      methodLabel: flow.methodLabel,
+      url: flow.url,
+      authorizationMethod: flow.authorizationMethod,
+      instructions: flow.instructions,
+      expiresAt: flow.expiresAt,
+    };
+  }
+
+  /**
    * Register a flow bound to the EXACT (connection revision, provider,
-   * methodIndex) with the LIVE session that performed authorize. Fails
-   * closed when the method index is out of range or the method requires
-   * prompt inputs Tenvyr will not drive.
+   * method fingerprint) with the LIVE session that performed authorize.
+   * Fails closed when the method index is out of range or the method
+   * requires prompt inputs Tenvyr will not drive.
+   *
+   * Ordering guarantee (post-PP1 hardening): the compatible-flow lookup
+   * and conflict rejection run BEFORE the MAX_ACTIVE_FLOWS check, so an
+   * existing flow stays idempotently retrievable even at capacity.
    */
   begin(input: {
     connectionId: string;
@@ -140,26 +259,31 @@ export class OpenCodeAuthFlowService implements OnModuleDestroy {
         `auth method "${method.label}" requires prompt inputs Tenvyr does not drive — use the official login command instead`,
       );
     }
+    // Idempotent Begin / conflict detection FIRST — at capacity too.
+    const classified = this.classifyExisting({
+      connectionId: input.connectionId,
+      connectionRevision: input.connectionRevision,
+      providerId: input.providerId,
+      methodIndex: input.methodIndex,
+      expectedType: method.type,
+      expectedLabel: method.label,
+    });
+    if (classified.kind === "compatible") {
+      // A competing session/authorize just happened on the losing side of
+      // a race; close it and keep the ORIGINAL retained session.
+      void input.session.close();
+      return classified.flow;
+    }
+    if (classified.kind === "conflict") {
+      void input.session.close();
+      throw new OpenCodeAuthFlowError("AUTH_FLOW_CONFLICT", classified.message);
+    }
     if (this.flows.size >= this.maxFlows) {
       void input.session.close();
       throw new OpenCodeAuthFlowError(
         "AUTH_FLOW_LIMIT",
         `too many active auth flows (max ${this.maxFlows})`,
       );
-    }
-    // One flow per (connection, provider): a concurrent flow for the same
-    // target would split the pending state across instances.
-    for (const existing of this.flows.values()) {
-      if (
-        existing.connectionId === input.connectionId &&
-        existing.providerId === input.providerId
-      ) {
-        void input.session.close();
-        throw new OpenCodeAuthFlowError(
-          "AUTH_FLOW_CONFLICT",
-          `an auth flow for ${input.providerId} on ${input.connectionId} is already active`,
-        );
-      }
     }
     const authFlowId = randomBytes(16).toString("hex");
     const expiresAt = Date.now() + this.ttlMs;
@@ -171,6 +295,9 @@ export class OpenCodeAuthFlowService implements OnModuleDestroy {
       connectionRevision: input.connectionRevision,
       providerId: input.providerId,
       methodIndex: input.methodIndex,
+      methodType: method.type,
+      methodLabel: method.label,
+      url: input.authorization.url,
       authorizationMethod: input.authorization.method,
       instructions: input.authorization.instructions,
       expiresAt,
@@ -178,16 +305,7 @@ export class OpenCodeAuthFlowService implements OnModuleDestroy {
       expiryTimer,
     };
     this.flows.set(authFlowId, flow);
-    return {
-      authFlowId,
-      connectionId: flow.connectionId,
-      connectionRevision: flow.connectionRevision,
-      providerId: flow.providerId,
-      methodIndex: flow.methodIndex,
-      authorizationMethod: flow.authorizationMethod,
-      instructions: flow.instructions,
-      expiresAt: flow.expiresAt,
-    };
+    return this.toBounded(flow);
   }
 
   /** Complete the flow through the SAME live session; on any failure the
@@ -236,12 +354,50 @@ export class OpenCodeAuthFlowService implements OnModuleDestroy {
     }
   }
 
-  /** Cancel: close the management session and drop the flow. */
+  /** Cancel: close the management session and drop the flow. Cleanup
+   *  only — deliberately requires NO connection authority, so a stale
+   *  flow can always be destroyed (never executed). */
   async cancel(authFlowId: string): Promise<boolean> {
     const flow = this.removeFlow(authFlowId);
     if (!flow) return false;
     await flow.session.close();
     return true;
+  }
+
+  /** Bounded non-secret read for authority fencing (null when absent). */
+  getFlow(authFlowId: string): OpenCodeAuthFlowV1 | null {
+    const flow = this.flows.get(authFlowId);
+    return flow ? this.toBounded(flow) : null;
+  }
+
+  /** Authority-fencing destroy: close the retained session and remove the
+   *  flow because it is stale (connection revoked or revised) — never a
+   *  provider callback. */
+  async destroy(authFlowId: string): Promise<boolean> {
+    return this.cancel(authFlowId);
+  }
+
+  /** Post-PP1 authority fence: remove every flow for (connection,
+   *  provider) bound to an OLD revision. Each retained management session
+   *  is closed immediately; no provider callback occurs. Only the CURRENT
+   *  revision may hold a live flow. */
+  async evictStaleFor(
+    connectionId: string,
+    providerId: string,
+    currentRevision: number,
+  ): Promise<number> {
+    let evicted = 0;
+    for (const flow of Array.from(this.flows.values())) {
+      if (
+        flow.connectionId === connectionId &&
+        flow.providerId === providerId &&
+        flow.connectionRevision !== currentRevision
+      ) {
+        await this.cancel(flow.authFlowId);
+        evicted += 1;
+      }
+    }
+    return evicted;
   }
 
   /** Deterministic process cleanup — wired into the Nest lifecycle
@@ -264,6 +420,33 @@ export class OpenCodeAuthFlowService implements OnModuleDestroy {
 
   activeCount(): number {
     return this.flows.size;
+  }
+
+  // Resume after reload: return compatible active flow for (connection, provider) if exists and not expired
+  getActiveFlowFor(connectionId: string, providerId: string): OpenCodeAuthFlowV1 | null {
+    for (const flow of this.flows.values()) {
+      if (flow.connectionId === connectionId && flow.providerId === providerId) {
+        if (flow.expiresAt > Date.now()) {
+          return this.toBounded(flow);
+        }
+        // Expired - clean up
+        this.expire(flow.authFlowId);
+        return null;
+      }
+    }
+    return null;
+  }
+
+  // List all active flows (bounded, non-secret — resume surface)
+  listActiveFlows(): OpenCodeAuthFlowV1[] {
+    const now = Date.now();
+    const result: OpenCodeAuthFlowV1[] = [];
+    for (const flow of this.flows.values()) {
+      if (flow.expiresAt > now) {
+        result.push(this.toBounded(flow));
+      }
+    }
+    return result;
   }
 }
 

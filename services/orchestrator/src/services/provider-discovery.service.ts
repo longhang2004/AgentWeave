@@ -35,6 +35,7 @@ import {
 } from "../executors/opencode-server";
 import { OpenCodeServerError } from "../executors/opencode-server";
 import {
+  BoundedKeyedMutex,
   OpenCodeAuthFlowError,
   OpenCodeAuthFlowService,
 } from "./opencode-auth-flow.service";
@@ -63,8 +64,11 @@ export class ProviderDiscoveryError extends Error {
       | "OPENCODE_SERVER_FAILED"
       | "INVALID_OAUTH_URL"
       | "INVALID_METHOD_INDEX"
+      | "AUTH_METHOD_INVALID"
       | "AUTH_METHOD_UNSUPPORTED"
       | "AUTH_METHOD_NOT_OAUTH"
+      | "AUTH_FLOW_CONFLICT"
+      | "AUTH_FLOW_STALE"
       | "PROVIDER_NOT_AUTHENTICATED"
       | "INVALID_MODEL_ID",
     message: string,
@@ -125,6 +129,12 @@ export class ProviderDiscoveryService {
   }
 
   private readonly authFlows: OpenCodeAuthFlowService;
+  /** Post-PP1 hardening: per-target Begin mutex — concurrent duplicate
+   *  Begins classify/authorize exactly once. Key is connectionId +
+   *  providerId ONLY (never revision): two Begins that race a revision
+   *  transition must serialize on the SAME lock, and each resolves the
+   *  authoritative CURRENT revision inside the critical section. */
+  private readonly beginLocks = new BoundedKeyedMutex();
 
   /** Load the connection, reject revoked/missing, return its CURRENT
    *  revision (the connection service enforces both). */
@@ -259,16 +269,38 @@ export class ProviderDiscoveryService {
   }
 
   /** Begin the runtime-owned auth flow for one provider of one connection.
-   *  Resolves the EXACT current revision, starts a LIVE management server
-   *  (RETAINED — never closed here; the flow owns its lifecycle), fetches
-   *  the fresh auth-method snapshot, VALIDATES the methodIndex and prompt
-   *  support BEFORE any authorize call, then performs POST authorize.
+   *  Post-PP1 hardening — OAuth flow authority is fenced to the CURRENT,
+   *  non-revoked RuntimeConnection revision from Begin → Resume →
+   *  Complete, and idempotent BEFORE external side effects — concurrently:
+   *
+   *  The whole critical section runs inside a mutex keyed by
+   *  (connectionId, providerId) ONLY. Inside the lock the authoritative
+   *  RuntimeConnection state is RE-READ (never a pre-lock snapshot):
+   *
+   *  - connection missing / REVOKED → fail closed (no session, no
+   *    authorize);
+   *  - flows bound to an OLD revision are STALE: their retained sessions
+   *    are closed and the flows removed before anything else;
+   *  - a compatible same-revision flow is returned DIRECTLY (same
+   *    authFlowId, same stored URL, ZERO new session, ZERO authorize);
+   *  - a different method on the current revision fails closed with
+   *    AUTH_FLOW_CONFLICT (ZERO new session, ZERO authorize);
+   *  - only then: start the LIVE management server, fetch the fresh
+   *    auth-method snapshot, validate methodIndex + expected type/label
+   *    fingerprint + prompt support BEFORE authorize, POST authorize once,
+   *    register the flow bound to the exact current revision.
+   *
    *  The same live session completes the flow (OpenCode pending state is
    *  instance-local). */
   async beginAuthFlow(input: {
     connectionId: string;
     providerId: string;
     methodIndex: number;
+    /** Bounded expected method fingerprint carried from the selection UI:
+     *  a fresh snapshot placing a different method at methodIndex fails
+     *  closed (AUTH_METHOD_INVALID) instead of authorizing the wrong one. */
+    expectedMethodType?: "oauth" | "api";
+    expectedMethodLabel?: string;
   }): Promise<{
     authFlowId: string;
     url: string;
@@ -277,9 +309,10 @@ export class ProviderDiscoveryService {
     connectionId: string;
     connectionRevision: number;
     providerId: string;
+    /** True when an existing compatible flow was resumed (no new session,
+     *  no new authorize). */
+    resumed: boolean;
   }> {
-    const revision = await this.resolveRevision(input.connectionId);
-    this.requireOpenCode(revision);
     if (
       !Number.isInteger(input.methodIndex) ||
       input.methodIndex < 0 ||
@@ -290,89 +323,238 @@ export class ProviderDiscoveryService {
         "method index must be a bounded non-negative integer",
       );
     }
-    const session = await OpenCodeManagementSession.start(
-      this.sessionProfile(revision),
+    // Concurrent-idempotent critical section, serialized per
+    // (connection, provider) across revision transitions.
+    return this.beginLocks.run(
+      `${input.connectionId}#${input.providerId}`,
+      async () => {
+        // Authoritative CURRENT state — resolved INSIDE the lock.
+        const revision = await this.resolveRevision(input.connectionId);
+        this.requireOpenCode(revision);
+        // Stale flows (older revisions) lose their retained sessions here;
+        // only the current revision may hold a live flow.
+        await this.authFlows.evictStaleFor(
+          input.connectionId,
+          input.providerId,
+          revision.revisionNumber,
+        );
+        const classified = this.authFlows.classifyExisting({
+          connectionId: input.connectionId,
+          connectionRevision: revision.revisionNumber,
+          providerId: input.providerId,
+          methodIndex: input.methodIndex,
+          ...(input.expectedMethodType !== undefined
+            ? { expectedType: input.expectedMethodType }
+            : {}),
+          ...(input.expectedMethodLabel !== undefined
+            ? { expectedLabel: input.expectedMethodLabel }
+            : {}),
+        });
+        if (classified.kind === "compatible") {
+          return {
+            authFlowId: classified.flow.authFlowId,
+            url: classified.flow.url,
+            method: classified.flow.authorizationMethod,
+            instructions: classified.flow.instructions,
+            connectionId: classified.flow.connectionId,
+            connectionRevision: classified.flow.connectionRevision,
+            providerId: classified.flow.providerId,
+            resumed: true,
+          };
+        }
+        if (classified.kind === "conflict") {
+          throw new ProviderDiscoveryError("AUTH_FLOW_CONFLICT", classified.message);
+        }
+        const session = await OpenCodeManagementSession.start(
+          this.sessionProfile(revision),
+        );
+        try {
+          const methodsByProvider = await session.authMethods();
+          const methods = methodsByProvider[input.providerId] ?? [];
+          const method = methods.find(
+            (candidate) => candidate.methodIndex === input.methodIndex,
+          );
+          if (!method) {
+            await session.close();
+            throw new ProviderDiscoveryError(
+              "INVALID_METHOD_INDEX",
+              `method index ${input.methodIndex} is not in the auth-method snapshot for ${input.providerId}`,
+            );
+          }
+          if (
+            (input.expectedMethodType !== undefined && method.type !== input.expectedMethodType) ||
+            (input.expectedMethodLabel !== undefined && method.label !== input.expectedMethodLabel)
+          ) {
+            // The fresh snapshot moved/changed the selected method — fail
+            // closed BEFORE authorize; never authorize the wrong method.
+            await session.close();
+            throw new ProviderDiscoveryError(
+              "AUTH_METHOD_INVALID",
+              `auth method at index ${input.methodIndex} changed (expected ${input.expectedMethodType ?? "any"} "${input.expectedMethodLabel ?? "any"}", found ${method.type} "${method.label}") — re-select the auth method`,
+            );
+          }
+          if (method.requiresPrompt) {
+            // Fail closed: never authorize with missing required inputs and
+            // never collect credentials. The guided runtime-owned fallback
+            // (opencode auth login --provider <id>) is the supported path.
+            await session.close();
+            throw new ProviderDiscoveryError(
+              "AUTH_METHOD_UNSUPPORTED",
+              `auth method "${method.label}" requires prompt inputs Tenvyr does not drive — use the official login command instead`,
+            );
+          }
+          if (method.type !== "oauth") {
+            // ONLY oauth methods belong in the /oauth/authorize flow. API
+            // methods must NEVER reach authorize: authentication stays
+            // runtime-owned via the guided official login command.
+            await session.close();
+            throw new ProviderDiscoveryError(
+              "AUTH_METHOD_NOT_OAUTH",
+              `auth method "${method.label}" (type ${method.type}) is not an OAuth method — authentication is managed by OpenCode: run \`opencode auth login --provider ${input.providerId}\``,
+            );
+          }
+          const authorization = await session.authorize(
+            input.providerId,
+            input.methodIndex,
+          );
+          const flow = this.authFlows.begin({
+            connectionId: input.connectionId,
+            connectionRevision: revision.revisionNumber,
+            providerId: input.providerId,
+            methodIndex: input.methodIndex,
+            methods,
+            session,
+            authorization,
+          });
+          return {
+            authFlowId: flow.authFlowId,
+            url: authorization.url,
+            method: authorization.method,
+            instructions: authorization.instructions,
+            connectionId: input.connectionId,
+            connectionRevision: revision.revisionNumber,
+            providerId: input.providerId,
+            resumed: false,
+          };
+        } catch (error) {
+          await session.close();
+          if (
+            error instanceof OpenCodeAuthFlowError ||
+            error instanceof OpenCodeServerError
+          ) {
+            throw new ProviderDiscoveryError(
+              error instanceof OpenCodeAuthFlowError &&
+                error.code === "AUTH_METHOD_UNSUPPORTED"
+                ? "AUTH_METHOD_UNSUPPORTED"
+                : "OPENCODE_SERVER_FAILED",
+              String((error as Error).message),
+            );
+          }
+          throw error;
+        }
+      },
     );
+  }
+
+  /** Browser-reload resume surface: bounded NON-SECRET views of the active
+   *  flows for one connection (optionally narrowed to one provider). Never
+   *  exposes the management-server password/token; the retained session
+   *  stays owned by the flow.
+   *
+   *  Post-PP1 authority fence: before ANY flow is returned the
+   *  RuntimeConnection is re-read. A revoked or missing connection
+   *  destroys every candidate flow (session closed, no callback) and
+   *  returns nothing; a flow bound to an OLD revision is stale — its
+   *  session is closed and it is never exposed to the frontend. */
+  async getActiveAuthFlows(
+    connectionId: string,
+    providerId?: string,
+  ): Promise<
+    Array<{
+      authFlowId: string;
+      connectionId: string;
+      connectionRevision: number;
+      providerId: string;
+      methodIndex: number;
+      methodType: "oauth" | "api";
+      methodLabel: string;
+      url: string;
+      authorizationMethod: "auto" | "code";
+      instructions: string | null;
+      expiresAt: number;
+    }>
+  > {
+    const candidates = this.authFlows
+      .listActiveFlows()
+      .filter(
+        (flow) =>
+          flow.connectionId === connectionId &&
+          (!providerId || flow.providerId === providerId),
+      );
+    if (candidates.length === 0) return [];
+    let currentRevision: number;
     try {
-      const methodsByProvider = await session.authMethods();
-      const methods = methodsByProvider[input.providerId] ?? [];
-      const method = methods.find(
-        (candidate) => candidate.methodIndex === input.methodIndex,
-      );
-      if (!method) {
-        await session.close();
-        throw new ProviderDiscoveryError(
-          "INVALID_METHOD_INDEX",
-          `method index ${input.methodIndex} is not in the auth-method snapshot for ${input.providerId}`,
-        );
-      }
-      if (method.requiresPrompt) {
-        // Fail closed: never authorize with missing required inputs and
-        // never collect credentials. The guided runtime-owned fallback
-        // (opencode auth login --provider <id>) is the supported path.
-        await session.close();
-        throw new ProviderDiscoveryError(
-          "AUTH_METHOD_UNSUPPORTED",
-          `auth method "${method.label}" requires prompt inputs Tenvyr does not drive — use the official login command instead`,
-        );
-      }
-      if (method.type !== "oauth") {
-        // ONLY oauth methods belong in the /oauth/authorize flow. API
-        // methods must NEVER reach authorize: authentication stays
-        // runtime-owned via the guided official login command.
-        await session.close();
-        throw new ProviderDiscoveryError(
-          "AUTH_METHOD_NOT_OAUTH",
-          `auth method "${method.label}" (type ${method.type}) is not an OAuth method — authentication is managed by OpenCode: run \`opencode auth login --provider ${input.providerId}\``,
-        );
-      }
-      const authorization = await session.authorize(
-        input.providerId,
-        input.methodIndex,
-      );
-      const flow = this.authFlows.begin({
-        connectionId: input.connectionId,
-        connectionRevision: revision.revisionNumber,
-        providerId: input.providerId,
-        methodIndex: input.methodIndex,
-        methods,
-        session,
-        authorization,
-      });
-      return {
-        authFlowId: flow.authFlowId,
-        url: authorization.url,
-        method: authorization.method,
-        instructions: authorization.instructions,
-        connectionId: input.connectionId,
-        connectionRevision: revision.revisionNumber,
-        providerId: input.providerId,
-      };
+      // Throws CONNECTION_NOT_FOUND / CONNECTION_REVOKED.
+      currentRevision = (await this.resolveRevision(connectionId))
+        .revisionNumber;
     } catch (error) {
-      await session.close();
-      if (
-        error instanceof OpenCodeAuthFlowError ||
-        error instanceof OpenCodeServerError
-      ) {
-        throw new ProviderDiscoveryError(
-          error instanceof OpenCodeAuthFlowError &&
-            error.code === "AUTH_METHOD_UNSUPPORTED"
-            ? "AUTH_METHOD_UNSUPPORTED"
-            : "OPENCODE_SERVER_FAILED",
-          String((error as Error).message),
-        );
+      const code = String((error as { code?: string }).code ?? "");
+      if (code !== "CONNECTION_NOT_FOUND" && code !== "CONNECTION_REVOKED") {
+        throw error;
       }
-      throw error;
+      // No OAuth authority remains on this connection: destroy lazily and
+      // return nothing.
+      for (const flow of candidates) {
+        await this.authFlows.destroy(flow.authFlowId);
+      }
+      return [];
     }
+    const live: typeof candidates = [];
+    for (const flow of candidates) {
+      if (flow.connectionRevision === currentRevision) {
+        live.push(flow);
+      } else {
+        // Stale revision: close the retained session; never expose the
+        // stale authorization URL.
+        await this.authFlows.destroy(flow.authFlowId);
+      }
+    }
+    return live;
   }
 
   /** Complete the runtime-owned flow through the SAME live session that
    *  performed authorize; proves connected via a refreshed GET /provider;
-   *  then closes the server and removes the flow. */
+   *  then closes the server and removes the flow.
+   *
+   *  Post-PP1 authority fence: BEFORE any provider callback, the
+   *  authoritative RuntimeConnection state is re-read. Revoked/missing →
+   *  CONNECTION_REVOKED (or NOT_FOUND), flow destroyed, callback count 0.
+   *  Revision mismatch → AUTH_FLOW_STALE, flow destroyed, callback count
+   *  0. A stale retained OpenCode session is never asked for a callback
+   *  and can never mark the CURRENT revision authenticated. */
   async completeAuthFlow(
     authFlowId: string,
     code?: string,
   ): Promise<{ connected: boolean; providerId: string; connectionId: string }> {
+    const flow = this.authFlows.getFlow(authFlowId);
+    if (flow) {
+      try {
+        const revision = await this.resolveRevision(flow.connectionId);
+        if (revision.revisionNumber !== flow.connectionRevision) {
+          await this.authFlows.destroy(authFlowId);
+          throw new ProviderDiscoveryError(
+            "AUTH_FLOW_STALE",
+            `auth flow belongs to revision ${flow.connectionRevision} of ${flow.connectionId}, but the current revision is ${revision.revisionNumber} — start authentication again`,
+          );
+        }
+      } catch (error) {
+        if (error instanceof ProviderDiscoveryError) throw error;
+        // CONNECTION_NOT_FOUND / CONNECTION_REVOKED from the authority
+        // primitive: destroy the flow, then propagate unchanged.
+        await this.authFlows.destroy(authFlowId);
+        throw error;
+      }
+    }
     return this.authFlows.complete(authFlowId, code);
   }
 

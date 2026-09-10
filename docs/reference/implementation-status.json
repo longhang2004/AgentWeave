@@ -534,6 +534,9 @@
     "services/local-executor-host/src/supervisor.ts",
     "services/local-executor-host/src/state.ts",
     "services/local-executor-host/src/main.ts",
+    "services/local-executor-host-rs/src/host.rs",
+    "services/local-executor-host-rs/src/supervisor.rs",
+    "services/local-executor-host-rs/src/protocol.rs",
     "services/orchestrator/src/agent-adapters/local-executor-host.loopback.spec.ts"
    ],
    "tests": [
@@ -541,6 +544,10 @@
     "services/local-executor-host/test/supervisor.spec.ts",
     "services/local-executor-host/test/state.spec.ts",
     "services/local-executor-host/integration/local-executor-host.integration.spec.ts",
+    "services/local-executor-host-rs/src/protocol.rs",
+    "services/local-executor-host-rs/src/supervisor.rs",
+    "services/local-executor-host-rs/src/host.rs",
+    "scripts/dev-ux.test.mjs",
     "services/orchestrator/src/agent-adapters/local-executor-host.loopback.spec.ts"
    ],
    "docs": [
@@ -548,11 +555,14 @@
     "docs/architecture/transports/adapter-model.md"
    ],
    "limitations": [
-    "Trusted-code-only: no sandbox; operator deployment configuration is the trust boundary",
+    "Trusted-code-only: operator deployment configuration is the trust boundary",
+    "TypeScript host has no OS sandbox; Rust host (TENVYR_EXECUTOR_HOST=rust) adds process-group isolation and Linux no_new_privs — Landlock/seccomp/cgroup are not wired",
+    "Rust host does not emit AgentEvents; the canonical result callback remains terminal authority",
     "One canonical result per run; the child cannot emit progress/artifact events",
     "Remote cancel is not supported (HTTP executor capability stays false); deadline/shutdown kills are the cancel mechanism",
     "Orphaned children from a crashed host are terminated on restart, never adopted or re-spawned",
-    "Local/operator-only while the external exposure gate is open"
+    "Local/operator-only while the external exposure gate is open",
+    "pnpm dev still defaults to the TypeScript host"
    ]
   },
   {

@@ -4,10 +4,12 @@ status: current
 audience:
   - developer
   - operator
-last_verified: 2026-08-10
+last_verified: 2026-09-10
 sources:
   - .env.example
   - docker-compose.yml
+  - scripts/dev.mjs
+  - services/local-executor-host-rs/src/host.rs
   - services/gateway/src/main.ts
   - services/gateway/src/app.controller.ts
   - services/orchestrator/src/agent-adapters/agent-transport-config.service.ts
@@ -79,6 +81,7 @@ any other HTTP agent.
 | `EXECUTOR_HOST_CALLBACK_ALLOWED_ORIGINS`       | Required comma-separated callback origins (the Orchestrator callback base URL).                                |
 | `EXECUTOR_HOST_CALLBACK_KEYS`                  | Required JSON `{ keyId: secret }` matching the agent's `callbackAuthentication`.                               |
 | `EXECUTOR_HOST_CALLBACK_ALLOW_INSECURE`        | Optional; only exact `true` permits HTTP callback URLs. Default HTTPS-only.                                    |
+| `TENVYR_EXECUTOR_HOST`                         | Optional. Exact `rust` makes `pnpm dev` launch `services/local-executor-host-rs` instead of the Node host. Default remains TypeScript. |
 
 The child environment is exactly the configured `env` allowlist plus
 resolved `secrets` (include `PATH` if the command needs it). The process

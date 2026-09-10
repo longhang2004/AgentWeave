@@ -5,7 +5,7 @@ audience:
   - developer
   - operator
   - product
-last_verified: 2026-08-16
+last_verified: 2026-09-10
 sources:
   - package.json
   - README.md
@@ -152,6 +152,7 @@ cleanup. If you previously started the full Compose stack
 hold the host ports the watch services need.
 
 `pnpm dev` covers the HTTP Worker path (orchestrator + gateway + Local Executor Host + dashboard).
+The default host is TypeScript; `TENVYR_EXECUTOR_HOST=rust pnpm dev` launches the additive Rust host instead (requires Cargo). See [local executor host](architecture/executors/local-executor-host.md).
 The Kafka-path agents (`pnpm dev:reviewer`, `pnpm dev:observability`) are not
 included because a host-run Kafka client cannot reach the Compose broker (it
 advertises its docker-internal hostname) — run those agents inside the full

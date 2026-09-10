@@ -45,6 +45,21 @@ const DEFAULT_SERVICES = [
   { name: "workbench", dir: "frontend", script: "dev", portEnv: "PORT", defaultPort: 4000, health: "/" },
 ];
 
+function hostServiceSpec(env = process.env) {
+  if ((env.TENVYR_EXECUTOR_HOST ?? "").trim() === "rust") {
+    return {
+      name: "host",
+      dir: "services/local-executor-host-rs",
+      command: "cargo",
+      args: ["run", "--quiet"],
+      portEnv: "EXECUTOR_HOST_PORT",
+      defaultPort: 3002,
+      health: "/health/live",
+    };
+  }
+  return DEFAULT_SERVICES.find((s) => s.name === "host");
+}
+
 /* ------------------------------------------------------------------ */
 /* Presentation helpers                                               */
 /* ------------------------------------------------------------------ */
@@ -325,15 +340,19 @@ export function buildManifest(env = process.env) {
   };
 
   const services = DEFAULT_SERVICES.map((service) => {
-    const port = portOf(service);
+    const spec = service.name === "host" ? hostServiceSpec(env) ?? service : service;
+    const port = portOf(spec);
     return {
-      ...service,
+      ...spec,
       port,
-      label: service.name[0].toUpperCase() + service.name.slice(1),
-      url: `http://localhost:${port}`,
-      command: "pnpm",
-      args: ["run", service.script],
-      cwd: join(ROOT, service.dir),
+      label: spec.name[0].toUpperCase() + spec.name.slice(1),
+      // Internal addressing is explicit IPv4 loopback — never dependent on
+      // localhost resolving to the same address family. Human-facing
+      // summaries may still display localhost.
+      url: `http://127.0.0.1:${port}`,
+      command: spec.command ?? "pnpm",
+      args: spec.args ?? ["run", spec.script],
+      cwd: join(ROOT, spec.dir),
       env: sharedDevEnv,
     };
   });

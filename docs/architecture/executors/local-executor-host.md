@@ -4,12 +4,14 @@ status: current
 audience:
   - developer
   - operator
-last_verified: 2026-08-12
+last_verified: 2026-09-10
 sources:
   - services/local-executor-host/src/config.ts
   - services/local-executor-host/src/supervisor.ts
   - services/local-executor-host/src/state.ts
   - services/local-executor-host/src/main.ts
+  - services/local-executor-host-rs/src/supervisor.rs
+  - services/local-executor-host-rs/src/host.rs
   - packages/worker/src
 ---
 
@@ -25,17 +27,21 @@ implements the canonical HTTP Worker protocol (via the reviewed
 executor: M3 descriptor pinning, profile-rotation safe failure, and
 cancel-capability evidence all apply unchanged.
 
-The host is **trusted-code-only**: there is no sandbox. It runs exactly the
-configured command in an explicit allowlisted environment. Operator
-deployment configuration is the trust boundary.
+The host is **trusted-code-only**: operator deployment configuration is the
+trust boundary. The default TypeScript host has no OS sandbox. The additive
+Rust host (`TENVYR_EXECUTOR_HOST=rust`) uses the same HTTP Worker protocol
+and spawn contract, plus a new process group and Linux `no_new_privs`;
+Landlock/seccomp/cgroup memory remain the upgrade path.
 
 ## Safety contract
 
 - **Fixed commands**: `command` must be an absolute path from
   `EXECUTOR_HOST_AGENTS`; the pipeline can never supply a path, command, or
   argument.
-- **No shell**: `child_process.spawn` with an argv array and `shell: false`.
-  Shell metacharacters in arguments are literal characters (tested).
+- **No shell**: argv array, never a shell. The TypeScript host uses
+  `child_process.spawn` with `shell: false`; the Rust host uses
+  `Command` with `env_clear` and no shell. Metacharacters in arguments
+  stay literal (tested in both).
 - **Allowlisted working root**: every `cwd` must resolve inside
   `EXECUTOR_HOST_ALLOWED_ROOT`; both paths are canonicalized.
 - **PP1 workspace execution**: when an invocation carries the reserved
@@ -46,8 +52,9 @@ deployment configuration is the trust boundary.
   `requireExecutionWorkspace: true` — workspace-less invocations are
   refused before spawn (fail closed). Absent member → the static
   configured `cwd` (backward compatible). See
-  [workspace execution / isolation](../workspace-execution.md). through the
-  filesystem, so traversal and symlink escapes are rejected at startup.
+  [workspace execution / isolation](../workspace-execution.md). Both hosts
+  canonicalize through the filesystem, so traversal and symlink escapes are
+  rejected at startup.
 - **Environment allowlist**: the child environment is EXACTLY the configured
   `env` (child var -> host env var) plus resolved `secrets` references. No
   inherited environment. Secret VALUES are resolved at spawn time and never
@@ -82,6 +89,22 @@ deployment configuration is the trust boundary.
 | deadline/wall-time/shutdown kill | `failed`, `EXECUTOR_HOST_DEADLINE` / `EXECUTOR_HOST_SHUTDOWN` (retryable true) |
 | stdout/stderr over the bound     | `failed`, `EXECUTOR_HOST_OUTPUT_LIMIT` (retryable false)                       |
 
+## Rust host (additive)
+
+Set `TENVYR_EXECUTOR_HOST=rust` before `pnpm dev` to run
+`services/local-executor-host-rs` instead of the Node host. Same env vars,
+same `/v1/runs` + signed callback contract, same fail-closed cwd/binding
+rules. Default remains the TypeScript host.
+
+```bash
+cargo test --manifest-path services/local-executor-host-rs/Cargo.toml
+```
+
+Limitations versus the TypeScript host: AgentEvents/heartbeats are not
+emitted yet (the result callback remains terminal authority); Landlock,
+seccomp, and cgroup memory bounds are not wired; macOS has process-group
+kill + `env_clear` only.
+
 ## Configuration
 
 See [operations/configuration.md](../../operations/configuration.md). One
@@ -93,6 +116,9 @@ concurrency 1 and a bounded queue.
 - Unit: config bounds/traversal/hostile names, no-shell argv, output limits,
   wall-time/invocation-deadline/shutdown kills, SIGKILL escalation, stdin
   delivery, orphan termination (including grandchildren).
+- Rust host: HMAC conformance vectors, cwd containment, argv literal
+  metacharacters, stdout byte cap, live/auth HTTP probes
+  (`cargo test --manifest-path services/local-executor-host-rs/Cargo.toml`).
 - Integration (real processes): signed canonical callback with HMAC
   verification, secret redaction in host logs, failure materialization,
   deadline kill.

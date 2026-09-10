@@ -4,7 +4,7 @@ status: current
 audience:
   - product
   - developer
-last_verified: 2026-08-12
+last_verified: 2026-09-10
 sources:
   - docs/reference/implementation-status.json
   - services
@@ -30,7 +30,7 @@ contracts.
 | Java runner and example agents                            | implemented | Example/runtime packages, not a general framework integration layer                           |
 | Gateway, frontend, readiness, showcase                    | implemented | General external APIs remain behind the open production-exposure gate                         |
 | AgentEvents and deterministic supervision                 | implemented | Events are evidence/liveness input, never execution authority                                 |
-| Executor descriptors and local executor host              | implemented | Host is trusted-code-only, bounded process execution; it is not a sandbox                     |
+| Executor descriptors and local executor host              | implemented | Default TypeScript host is trusted-code-only; opt-in Rust host (`TENVYR_EXECUTOR_HOST=rust`) speaks the same HTTP Worker protocol with process-group isolation (Linux `no_new_privs`; Landlock/cgroup not wired) |
 | Runtime Connections (M8)                                  | implemented | Immutable secret-free revisions, linearizable claim/revoke under the authority-row lock, frozen attempt identity, bounded probes and test receipts, audited local create/revise/test/revoke commands; runtime profiles pinned 2026-08-12 (codex 0.147.0, claude 2.1.228, opencode 1.18.16); live gates opt-in |
 | Supervised agent team execution (M9)                      | implemented | Deterministic Coordinator loop with exact iteration identity, Planner-attempt ownership, strict baseRevision (stale proposals activate nothing; no silent rebase), concurrent-start convergence, and role/executor allowlist enforcement on every run-creation path |
 | Operator Workbench (M10)                                  | implemented | Bounded read projections; idempotent audited command surface including Runtime Connection operations (create/revise/test/revoke); deterministic offline demo; loopback/private trusted-operator surface |

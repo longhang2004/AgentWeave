@@ -679,4 +679,12 @@ describe("dev launcher dynamic bridge composition (buildManifest)", () => {
     assert.ok(!formatted.includes(token1));
     assert.ok(!formatted.includes(secret1));
   });
+
+  test("TENVYR_EXECUTOR_HOST=rust launches the additive Rust host binary", () => {
+    const manifest = buildManifest({ TENVYR_EXECUTOR_HOST: "rust" });
+    const host = manifest.services.find((s) => s.name === "host");
+    assert.equal(host.command, "cargo");
+    assert.deepEqual(host.args, ["run", "--quiet"]);
+    assert.match(host.cwd, /local-executor-host-rs$/);
+  });
 });

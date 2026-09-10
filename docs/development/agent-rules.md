@@ -3,7 +3,7 @@ title: Agent Rules and Mechanics
 status: current
 audience:
   - developer
-last_verified: 2026-07-28
+last_verified: 2026-09-10
 sources:
   - AGENTS.md
   - CLAUDE.md
@@ -11,6 +11,7 @@ sources:
   - scripts/codegraph-init.sh
   - scripts/install-skills.sh
   - scripts/rtk-compress.sh
+  - services/local-executor-host-rs/Cargo.toml
 ---
 
 # Agent rules and mechanics
@@ -149,3 +150,10 @@ These tools may improve a developer-agent workflow, but they are not Tenvyr runt
 - **Interfaces:** Run `pnpm run smoke:e2e` (an alias for `node scripts/smoke-e2e.mjs`); requires Node 18+ for the built-in global `fetch`. The script health-checks gateway `:3000`, orchestrator `:3001`, code-reviewer `:3002`, observability `:3003`, and agent-runner `:8085` (all via `/health`), plus the frontend `:4000/` and `:4000/dashboard` routes, then creates a sample pipeline, triggers an execution, and polls to a terminal state with a bounded 120s timeout. It exits `0` only on `COMPLETED`, with distinct non-zero exit codes for health, create, trigger, `FAILED`, and timeout failures. Base URLs can be overridden via `SMOKE_*_URL` environment variables.
 - **Rules:** Run against an already-started stack (use the Port_Override_Mechanism above if infra host ports are occupied). Stop and remove any temporary containers afterward with `docker compose ... down`.
 - **Verification:** With the stack up, `pnpm run smoke:e2e` prints `COMPLETED` and exits `0`.
+
+### Additive Rust local executor host
+
+- **Purpose:** Optional process-isolation host that speaks the same HTTP Worker protocol as `@tenvyr/local-executor-host`. Does not replace Orchestrator, Gateway, Frontend, or Worker SDKs.
+- **Interfaces:** `POST /v1/runs`, `GET /health/live`, `GET /health/ready`; HMAC v1 callback headers; same `EXECUTOR_HOST_*` environment. Launch via `TENVYR_EXECUTOR_HOST=rust pnpm dev` or `cargo run --manifest-path services/local-executor-host-rs/Cargo.toml`.
+- **Rules:** Keep it behind the adapter boundary. Do not import Orchestrator internals. Preserve fail-closed cwd/binding checks, no-shell argv, env_clear, process-group kill. Do not emit a second terminal result. Landlock/seccomp/cgroup are explicit follow-ups, not drive-by additions.
+- **Verification:** `cargo test --manifest-path services/local-executor-host-rs/Cargo.toml`; `node --test scripts/dev-ux.test.mjs`.

@@ -3,15 +3,17 @@ title: Local Development
 status: current
 audience:
   - developer
-last_verified: 2026-08-15
+last_verified: 2026-09-10
 sources:
   - package.json
   - docker-compose.yml
   - docker-compose.no-host-ports.yml
+  - scripts/dev.mjs
   - examples/typescript-http-worker/package.json
   - examples/python-http-worker/src/main.py
   - sdks/python-worker/pyproject.toml
   - services/agent-runner/pom.xml
+  - services/local-executor-host-rs/Cargo.toml
 ---
 
 # Local development
@@ -22,6 +24,7 @@ sources:
 - Python 3.11 or newer for the private Python Worker SDK.
 - JDK 17 and Maven for the Java Agent Runner release path.
 - Docker with Docker Compose. The no-host-ports override requires Compose 2.24 or newer because it uses `!reset`.
+- Optional: Rustc 1.80+ / Cargo to run the additive local executor host (`TENVYR_EXECUTOR_HOST=rust`). The default `pnpm dev` host remains TypeScript.
 
 Dependency installation may use the network:
 
@@ -77,6 +80,9 @@ parallel watch mode:
 ```bash
 pnpm dev
 ```
+
+Opt into the additive Rust executor host with `TENVYR_EXECUTOR_HOST=rust pnpm dev`
+(requires Cargo). The default remains the TypeScript host.
 
 `pnpm dev` composes the automatic development Local Runtime Bridge:
 - Ephemeral cryptographically random bearer and callback secrets.

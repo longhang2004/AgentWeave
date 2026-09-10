@@ -5,7 +5,7 @@ audience:
   - developer
   - operator
   - product
-last_verified: 2026-08-16
+last_verified: 2026-09-10
 sources:
   - package.json
   - README.md
@@ -151,6 +151,7 @@ không chạy được. Nếu trước đó bạn đã khởi động toàn bộ
 ứng dụng của nó đang giữ cổng host mà các dịch vụ watch cần.
 
 `pnpm dev` bao phủ đường HTTP Worker (orchestrator + gateway + Local Executor Host + dashboard).
+Host mặc định là TypeScript; `TENVYR_EXECUTOR_HOST=rust pnpm dev` chạy host Rust bổ sung (cần Cargo). Xem [local executor host](architecture/executors/local-executor-host.md).
 Các agent đường Kafka (`pnpm dev:reviewer`, `pnpm dev:observability`) không
 được bao gồm vì client Kafka chạy trên host không kết nối được broker Compose
 (nó quảng bá hostname nội bộ docker) — hãy chạy các agent đó bên trong toàn bộ

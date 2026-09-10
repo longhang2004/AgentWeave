@@ -40,6 +40,7 @@
     "self-hosted:health": "curl -s http://127.0.0.1:3001/health",
     "dev:verbose": "TENVYR_LOG_LEVEL=verbose node scripts/dev.mjs",
     "test:dev-ux": "node --test scripts/dev-ux.test.mjs",
+    "test:executor-host-rs": "cargo test --manifest-path services/local-executor-host-rs/Cargo.toml",
     "test": "node --test scripts/dev-ux.test.mjs"
   },
   "devDependencies": {

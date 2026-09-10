@@ -206,6 +206,7 @@ const wireProtocolPaths = new Set([
   "services/orchestrator/src/agent-adapters/http-worker.integration.spec.ts",
   "packages/worker/test/callback.spec.ts",
   "services/local-executor-host/integration/local-executor-host.integration.spec.ts",
+  "services/local-executor-host-rs/src/protocol.rs",
   "sdks/python-worker/src/tenvyr_worker/_callback/delivery.py",
   "sdks/python-worker/README.md",
   "sdks/python-worker/CONFORMANCE.md",
@@ -430,6 +431,15 @@ export const requiredLegacyIdentifiers = Object.freeze([
           "m",
         ),
         `HEADER_${["KEY_ID", "TIMESTAMP", "DELIVERY_ID", "SIGNATURE"][index]} = "${header}"`,
+      ),
+      requiredPattern(
+        `rust-host-sends-${header}`,
+        "services/local-executor-host-rs/src/protocol.rs",
+        new RegExp(
+          `^[\\t ]*pub const HEADER_${["KEY_ID", "TIMESTAMP", "DELIVERY_ID", "SIGNATURE"][index]}:[\\t ]*&str[\\t ]*=[\\t ]*(["'])${escapeRegExp(header)}\\1;[\\t ]*$`,
+          "m",
+        ),
+        `pub const HEADER_${["KEY_ID", "TIMESTAMP", "DELIVERY_ID", "SIGNATURE"][index]}: &str = "${header}";`,
       ),
     ];
   }),

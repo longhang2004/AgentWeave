@@ -42,6 +42,7 @@ python scripts/verify-python-worker-package.py
 pnpm verify:package-packs
 pnpm test:identity
 pnpm verify:identity
+pnpm test:executor-host-rs
 ```
 
 Optional local CodeGraph, skills, persistent-memory, and output-compression tools

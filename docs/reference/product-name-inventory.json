@@ -309,6 +309,7 @@
       "docs/architecture/workers/typescript-worker-sdk.md",
       "packages/worker/src/callback/callback-delivery.ts",
       "sdks/python-worker/src/tenvyr_worker/_callback/delivery.py",
+      "services/local-executor-host-rs/src/protocol.rs",
       "services/orchestrator/src/agent-adapters/http-agent-callback.controller.ts"
     ],
     "publicCompatibilityImpact": "wire-compatible",
@@ -323,6 +324,7 @@
       "docs/architecture/workers/typescript-worker-sdk.md",
       "packages/worker/src/callback/callback-delivery.ts",
       "sdks/python-worker/src/tenvyr_worker/_callback/delivery.py",
+      "services/local-executor-host-rs/src/protocol.rs",
       "services/orchestrator/src/agent-adapters/http-agent-callback.controller.ts"
     ],
     "publicCompatibilityImpact": "wire-compatible",
@@ -337,6 +339,7 @@
       "docs/architecture/workers/typescript-worker-sdk.md",
       "packages/worker/src/callback/callback-delivery.ts",
       "sdks/python-worker/src/tenvyr_worker/_callback/delivery.py",
+      "services/local-executor-host-rs/src/protocol.rs",
       "services/orchestrator/src/agent-adapters/http-agent-callback.controller.ts"
     ],
     "publicCompatibilityImpact": "wire-compatible",
@@ -351,6 +354,7 @@
       "docs/architecture/workers/typescript-worker-sdk.md",
       "packages/worker/src/callback/callback-delivery.ts",
       "sdks/python-worker/src/tenvyr_worker/_callback/delivery.py",
+      "services/local-executor-host-rs/src/protocol.rs",
       "services/orchestrator/src/agent-adapters/http-agent-callback.controller.ts"
     ],
     "publicCompatibilityImpact": "wire-compatible",

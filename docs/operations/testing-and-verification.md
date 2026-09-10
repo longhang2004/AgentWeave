@@ -3,7 +3,7 @@ title: Testing and Verification
 status: current
 audience:
   - developer
-last_verified: 2026-07-28
+last_verified: 2026-09-10
 sources:
   - package.json
   - packages/worker/package.json
@@ -14,6 +14,7 @@ sources:
   - scripts/verify-product-identity.mjs
   - scripts/verify-package-packs.mjs
   - scripts/verify-python-worker-package.py
+  - services/local-executor-host-rs/Cargo.toml
 ---
 
 # Testing and verification
@@ -76,6 +77,7 @@ pnpm verify:docs
 pnpm verify:package-packs
 python scripts/verify-python-worker-package.py
 python scripts/sync-python-worker-schemas.py check
+pnpm test:executor-host-rs
 ```
 
 The Python loopback intentionally fails when `TENVYR_PYTHON_EXECUTABLE` is absent. Identity and documentation tests exercise their verifiers with adversarial fixtures; the verifier commands audit the real repository.

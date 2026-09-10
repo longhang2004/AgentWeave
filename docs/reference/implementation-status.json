@@ -114,7 +114,8 @@
    ],
    "tests": [
     "services/gateway/src/app.controller.spec.ts",
-    "services/gateway/src/local-origin.spec.ts"
+    "services/gateway/src/local-origin.spec.ts",
+    "services/gateway/src/active-flow-proxy.spec.ts"
    ],
    "docs": [
     "docs/architecture/control-plane.md",
@@ -989,7 +990,9 @@
     "services/orchestrator/src/executors/runtime-profiles.spec.ts",
     "services/orchestrator/src/phase2-model-targets-dogfood.spec.ts",
     "services/local-executor-host/test/config.spec.ts",
-    "services/local-executor-host/test/supervisor.spec.ts"
+    "services/local-executor-host/test/supervisor.spec.ts",
+    "services/orchestrator/src/post-pp1-hardening.spec.ts",
+    "frontend/src/lib/tenvyr-api/picker-readiness.test.mjs"
    ],
    "docs": [
     "docs/architecture/provider-connections.md",
@@ -1020,7 +1023,12 @@
     "frontend/src/lib/tenvyr-api/guards.test.mjs",
     "scripts/self-hosted/contract.test.mjs",
     "services/orchestrator/src/model-source-p2.spec.ts",
-    "services/orchestrator/src/phase2-provider-command.spec.ts"
+    "services/orchestrator/src/phase2-provider-command.spec.ts",
+    "services/orchestrator/src/opencode-auth-flow-hardening.spec.ts",
+    "services/orchestrator/src/post-pp1-hardening.spec.ts",
+    "services/orchestrator/src/operator-auth-flow.integration.spec.ts",
+    "frontend/src/lib/tenvyr-api/picker-readiness.test.mjs",
+    "services/orchestrator/src/reload-resume.gateway.integration.spec.ts"
    ],
    "docs": [
     "docs/architecture/provider-connections.md"
@@ -1029,7 +1037,8 @@
     "model_sources is the GENERIC OpenAI-compatible catalog endpoint configuration only (advanced surface); provider state is RUNTIME-OWNED (STRUCTURED OpenCode Server API discovery \u2014 opencode serve GET /provider + /provider/auth, TUI output never parsed \u2014 plus codex login status, claude auth status) and never a source row",
     "9Router is NOT a first-class Tenvyr concept (it inspired the provider-management UX only); an existing instance connects as a generic OpenAI-compatible endpoint \u2014 Tenvyr contains no routing/fallback/quota/rotation/alias logic",
     "Catalogs are bounded on-demand projections, never persisted as authority; catalog visibility never equals execution compatibility",
-    "External Production Exposure Gate stays open: catalog endpoints are a single-owner operator feature (SSRF threat documented)"
+    "External Production Exposure Gate stays open: catalog endpoints are a single-owner operator feature (SSRF threat documented)",
+    "OAuth flow authority is fenced to the exact current non-revoked RuntimeConnection revision: Begin serializes per (connection, provider) and resolves authoritative revision inside the lock; stale-revision flows are evicted (session closed, no callback); resume returns nothing for revoked/revised connections; Complete fails CONNECTION_REVOKED/AUTH_FLOW_STALE with zero callbacks; no durable OAuth session recovery across Orchestrator restart"
    ]
   },
   {

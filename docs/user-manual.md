@@ -301,11 +301,22 @@ traffic — the chain stays `Tenvyr -> Executor -> Agent Runtime -> Provider`.
 
 - **OpenCode** — first-class provider management. One row per provider
   (provider id, Connected / Not connected, **Models** / **Test** per
-  connected provider). A not-connected provider offers **[Connect]**, which
-  copies the official `opencode auth login --provider <id>` command with
-  **Copy Command** / **Check Again** — credentials never pass through
-  Tenvyr; the auth file is never read and raw auth output is never
-  persisted.
+  connected provider). A not-connected provider offers **[Connect]**:
+
+  - **OAuth-capable methods** — pick the auth method, **Start
+    Authorization**: Tenvyr opens the provider's own authorization page.
+    Complete it in that provider window, then **Complete** in the SAME
+    session: Tenvyr asks the runtime to prove the connection and refreshes
+    the row to Connected. Beginning twice returns the SAME flow and URL
+    (no duplicate authorizations); a browser reload restores the pending
+    flow with its exact URL until it expires — but only while the
+    connection is still current and not revoked: revoking the connection
+    or revising it invalidates the pending flow (start again). An
+    Orchestrator process restart fails closed — start the flow again.
+  - **API-key methods** — the dialog copies the official
+    `opencode auth login --provider <id>` command with **Copy Command** /
+    **Check Again** — credentials never pass through Tenvyr; the auth file
+    is never read and raw auth output is never persisted.
 - **Codex** — a single implied provider (OpenAI); auth status from the
   runtime onboarding probe, sign-in via `codex login`.
 - **Claude Code** — a single implied provider (Anthropic); auth status

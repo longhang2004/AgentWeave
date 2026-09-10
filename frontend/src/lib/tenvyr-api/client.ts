@@ -1,5 +1,6 @@
 import { TenvyrApiError } from "./errors.ts";
 import type {
+  ActiveAuthFlowV1,
   ApiResponse,
   RuntimeKind,
   RuntimeOnboardingStatusV1,
@@ -27,9 +28,11 @@ import type {
   OpenCodeAuthBeginV1,
 } from "./types.ts";
 
+// Internal loopback default (server-side rendering / node clients) — IPv4
+// explicit so it never depends on localhost address-family resolution.
 export const GATEWAY_API_URL =
   process.env.NEXT_PUBLIC_API_URL ||
-  (typeof window !== "undefined" ? "" : "http://localhost:3000");
+  (typeof window !== "undefined" ? "" : "http://127.0.0.1:3000");
 
 export class TenvyrApiClient {
   private baseUrl: string;
@@ -354,18 +357,43 @@ export class TenvyrApiClient {
   }
 
   /** Audited: BEGIN the runtime-owned OpenCode auth flow with the SELECTED
-   *  METHOD INDEX. The same live management session completes the flow;
+   *  METHOD INDEX plus its expected fingerprint (type + label) from the
+   *  selection UI. Idempotent BEFORE external side effects: an existing
+   *  compatible flow is returned unchanged; a reordered/changed method
+   *  fails closed. The same live management session completes the flow;
    *  Tenvyr never sees tokens. */
   async openCodeOauthBegin(
     connectionId: string,
     providerId: string,
     methodIndex: number,
+    expected?: { type: "oauth" | "api"; label: string },
     idempotencyKey: string = crypto.randomUUID(),
   ): Promise<ApiResponse<WorkbenchCommandResultV1<OpenCodeAuthBeginV1>>> {
     return this.request("/api/provider-discovery/commands/oauth-begin", {
       method: "POST",
-      body: { idempotencyKey, connectionId, providerId, methodIndex },
+      body: {
+        idempotencyKey,
+        connectionId,
+        providerId,
+        methodIndex,
+        ...(expected ? { expectedMethodType: expected.type, expectedMethodLabel: expected.label } : {}),
+      },
     });
+  }
+
+  /** Post-PP1 hardening: browser-reload resume read — the active unexpired
+   *  auth flow(s) for a connection (optionally one provider). Bounded
+   *  non-secret data only (authFlowId, method identity, authorization URL,
+   *  instructions, expiry); never the management-server password/token. */
+  async getActiveAuthFlows(
+    connectionId: string,
+    providerId?: string,
+  ): Promise<ApiResponse<ActiveAuthFlowV1[]>> {
+    const params = new URLSearchParams({ connectionId });
+    if (providerId) params.set("providerId", providerId);
+    return this.request(
+      `/api/provider-discovery/auth-flows/active?${params.toString()}`,
+    );
   }
 
   /** Audited: COMPLETE the flow through the same live session. The bounded

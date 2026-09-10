@@ -23,8 +23,10 @@ export class AppController {
   private orchestratorUrl: string;
 
   constructor(private socketGateway: SocketGateway) {
+    // Internal loopback default — never depend on localhost address-family
+    // resolution; explicit ORCHESTRATOR_URL override is preserved.
     this.orchestratorUrl =
-      process.env.ORCHESTRATOR_URL || "http://localhost:3001";
+      process.env.ORCHESTRATOR_URL || "http://127.0.0.1:3001";
   }
 
   @Get("health")
@@ -208,6 +210,25 @@ export class AppController {
       method: "POST",
       body,
     });
+  }
+
+  /** Post-PP1 hardening: browser-reload resume proxy. Forwards ONLY the
+   *  bounded query params (connectionId, providerId) to the Orchestrator's
+   *  active-flow read endpoint and returns its bounded non-secret
+   *  projection unchanged (authFlowId, method identity, authorization URL,
+   *  instructions, expiry — never a management password/token). */
+  @Get("api/provider-discovery/auth-flows/active")
+  async getActiveAuthFlow(
+    @Query("connectionId") connectionId?: string,
+    @Query("providerId") providerId?: string,
+  ) {
+    const params = new URLSearchParams();
+    if (connectionId) params.set("connectionId", connectionId);
+    if (providerId) params.set("providerId", providerId);
+    const query = params.toString();
+    return this.forwardToOrchestrator(
+      `/provider-discovery/auth-flows/active${query ? `?${query}` : ""}`,
+    );
   }
 
   @Post("api/provider-discovery/commands/test-target")

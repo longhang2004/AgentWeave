@@ -316,10 +316,22 @@ Tenvyr định tuyến lưu lượng suy luận — chuỗi luôn là
 
 - **OpenCode** — quản lý provider hạng nhất. Mỗi provider một hàng (provider
   id, Connected / Not connected, **Models** / **Test** cho provider đã kết
-  nối). Provider chưa kết nối có nút **[Connect]**, sao chép lệnh chính thức
-  `opencode auth login --provider <id>` kèm **Copy Command** / **Check
-  Again** — thông tin xác thực không bao giờ đi qua Tenvyr; file auth không
-  bao giờ bị đọc và output auth thô không bao giờ được lưu.
+  nối). Provider chưa kết nối có nút **[Connect]**:
+
+  - **Phương thức OAuth** — chọn method, **Start Authorization**: Tenvyr
+    mở trang ủy quyền của chính provider. Hoàn tất trên cửa sổ đó, rồi
+    **Complete** trong CÙNG phiên: Tenvyr nhờ runtime chứng minh kết nối
+    và làm mới hàng thành Connected. Bấm Begin hai lần trả về CÙNG flow
+    và URL (không ủy quyền trùng); reload trình duyệt khôi phục flow
+    đang chờ với đúng URL cho đến khi hết hạn — nhưng chỉ khi connection
+    vẫn hiện hành và chưa bị thu hồi: thu hồi hoặc revise sẽ hủy flow
+    (bắt đầu lại). Restart process Orchestrator fail-closed — bắt đầu
+    flow lại.
+  - **Phương thức API key** — dialog sao chép lệnh chính thức
+    `opencode auth login --provider <id>` kèm **Copy Command** /
+    **Check Again** — thông tin xác thực không bao giờ đi qua Tenvyr;
+    file auth không bao giờ bị đọc và output auth thô không bao giờ
+    được lưu.
 - **Codex** — một provider ngầm định duy nhất (OpenAI); trạng thái xác thực
   từ probe onboarding runtime, đăng nhập qua `codex login`.
 - **Claude Code** — một provider ngầm định duy nhất (Anthropic); trạng thái

@@ -8,6 +8,7 @@ import {
   parseRuntimeModelsRefresh,
   parseTestTargetEvidence,
   parseWorkbenchCommandResult,
+  pickerReadiness,
   selectableProviders,
   providerStateKey,
 } from "../../lib/tenvyr-api/guards.ts";
@@ -308,11 +309,18 @@ export function RuntimeTargetPicker({
         aria-label="Runtime"
       >
         <option value="">{placeholder}</option>
-        {connections.map((c) => (
-          <option key={c.connectionId} value={c.connectionId}>
-            {c.name} ({c.runtimeKind})
-          </option>
-        ))}
+        {connections.map((c) => {
+          // Post-PP1 hardening: truthful entries — unavailable connections
+          // are disabled with their reason; DEGRADED selectable but warned.
+          const readiness = pickerReadiness(c);
+          return (
+            <option key={c.connectionId} value={c.connectionId} disabled={!readiness.selectable}>
+              {c.name} ({c.runtimeKind})
+              {readiness.selectable && readiness.reason ? ` — ⚠ ${readiness.reason}` : ""}
+              {!readiness.selectable && readiness.reason ? ` — ${readiness.reason}` : ""}
+            </option>
+          );
+        })}
       </select>
 
       {selectedConnection ? (

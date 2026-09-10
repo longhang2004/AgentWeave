@@ -18,6 +18,7 @@ import { tenvyrApi } from "../../../lib/tenvyr-api/client.ts";
 import {
   parseProviderDiscovery,
   parseWorkbenchCommandResult,
+  pickerReadiness,
 } from "../../../lib/tenvyr-api/guards.ts";
 import type {
   TeamTemplateV1,
@@ -379,7 +380,31 @@ function NewTeamRunContent() {
     }
   };
 
-  const activeConnections = connections.filter((c) => !c.revoked);
+  // Post-PP1 hardening: truthful picker. Core filtering is accepted
+  // backend authority — this only makes it VISIBLE: unavailable /
+  // AUTH_REQUIRED connections render as disabled entries with the reason,
+  // DEGRADED stays selectable but visibly warned, REVOKED never selectable.
+  const pickerEntries = connections.map((c) => ({
+    card: c,
+    ...pickerReadiness(c),
+  }));
+  const selectableConnections = pickerEntries.filter((e) => e.selectable);
+
+  /** One <option> per connection: selectable entries carry a degraded
+   *  marker when warned; the rest are disabled with their exact reason. */
+  const connectionOptions = pickerEntries.map(({ card, selectable, reason }) => (
+    <option
+      key={card.connectionId}
+      value={`conn:${card.connectionId}`}
+      disabled={!selectable}
+    >
+      {card.name} ({card.connectionId})
+      {selectable && reason ? ` — ⚠ ${reason}` : ""}
+      {!selectable && reason ? ` — ${reason}` : ""}
+    </option>
+  ));
+
+  const activeConnections = selectableConnections.map((e) => e.card);
 
   return (
     <div className="page-container" style={{ maxWidth: "840px" }}>
@@ -687,14 +712,7 @@ function NewTeamRunContent() {
                     className="form-select"
                   >
                     <optgroup label="Runtime Connections">
-                      {activeConnections.map((c) => (
-                        <option
-                          key={c.connectionId}
-                          value={`conn:${c.connectionId}`}
-                        >
-                          {c.name} ({c.connectionId})
-                        </option>
-                      ))}
+                      {connectionOptions}
                     </optgroup>
                     <optgroup label="Local Agent Adapters">
                       <option value="agent:planner">Local Planner</option>
@@ -776,14 +794,7 @@ function NewTeamRunContent() {
                     className="form-select"
                   >
                     <optgroup label="Runtime Connections">
-                      {activeConnections.map((c) => (
-                        <option
-                          key={c.connectionId}
-                          value={`conn:${c.connectionId}`}
-                        >
-                          {c.name} ({c.connectionId})
-                        </option>
-                      ))}
+                      {connectionOptions}
                     </optgroup>
                     <optgroup label="Local Agent Adapters">
                       <option value="agent:verifier">Local Verifier</option>
@@ -851,7 +862,7 @@ function NewTeamRunContent() {
                     >
                       <div style={{ flex: 1 }}>
                         <RuntimeTargetPicker
-                          connections={activeConnections}
+                          connections={connections}
                           value={target}
                           onChange={(next) => {
                             const updated = [...workerTargets];
@@ -881,22 +892,22 @@ function NewTeamRunContent() {
                 </div>
               )}
 
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => {
-                  const first = activeConnections[0];
-                  if (first) {
-                    setWorkerTargets([
-                      ...workerTargets,
-                      { connectionId: first.connectionId },
-                    ]);
-                  }
-                }}
-                disabled={activeConnections.length === 0}
-              >
-                + Add Worker Target
-              </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    const first = activeConnections[0];
+                    if (first) {
+                      setWorkerTargets([
+                        ...workerTargets,
+                        { connectionId: first.connectionId },
+                      ]);
+                    }
+                  }}
+                  disabled={activeConnections.length === 0}
+                >
+                  + Add Worker Target
+                </button>
 
               <div
                 className="form-group"

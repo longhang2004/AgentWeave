@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   CheckCircle2,
   XCircle,
@@ -18,6 +18,7 @@ import {
 import { tenvyrApi } from "../../lib/tenvyr-api/client.ts";
 import {
   MalformedResponseError,
+  parseActiveAuthFlows,
   parseConnectionTestResult,
   parseOpenCodeAuthBegin,
   parseProviderAuthMethods,
@@ -124,6 +125,11 @@ export default function RuntimesPage() {
     instructions: string | null;
     codeInput: string;
   } | null>(null);
+  // Resume guard: loadData must never clobber an in-flight connect flow.
+  const connectFlowRef = useRef(connectFlow);
+  useEffect(() => {
+    connectFlowRef.current = connectFlow;
+  }, [connectFlow]);
 
   // Advanced Connection Form state
   const [showAdvanced, setShowAdvanced] = useState<boolean>(false);
@@ -192,6 +198,41 @@ export default function RuntimesPage() {
           }),
       );
       setProvidersByConnection(providerMap);
+
+      // Post-PP1 hardening: browser-reload resume. For any opencode
+      // connection with an ACTIVE UNEXPIRED auth flow, restore the connect
+      // panel with the SAME authFlowId/URL/instructions from the retained
+      // session — Complete/Cancel continue through that exact session.
+      // An expired flow returns nothing here; the operator starts fresh.
+      if (!connectFlowRef.current) {
+        for (const card of providerCards.filter((c) => c.runtimeKind === "opencode")) {
+          try {
+            const res = await tenvyrApi.getActiveAuthFlows(card.connectionId);
+            if (!res.success) continue;
+            const flows = parseActiveAuthFlows(res.data);
+            const active = flows[0];
+            if (active) {
+              setConnectFlow({
+                connectionId: active.connectionId,
+                providerId: active.providerId,
+                step: "begin",
+                error: null,
+                authMethods: [],
+                loading: false,
+                selectedMethodIndex: active.methodIndex,
+                authFlowId: active.authFlowId,
+                url: active.url,
+                method: active.authorizationMethod,
+                instructions: active.instructions,
+                codeInput: "",
+              });
+              break;
+            }
+          } catch {
+            // best-effort resume
+          }
+        }
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setNotice({
@@ -687,17 +728,23 @@ export default function RuntimesPage() {
     }
   };
 
-  /** Begin: start the flow with the SELECTED method index (one live
-   *  session retained). */
+  /** Begin: start the flow with the SELECTED method index AND its expected
+   *  fingerprint (type + label) from the snapshot the operator actually
+   *  saw — a reordered/changed fresh snapshot fails closed server-side.
+   *  One live session retained. */
   const handleOauthBegin = async (connectionId: string, providerId: string) => {
     const flow = connectFlow;
     if (!flow || flow.selectedMethodIndex === null) return;
+    const selectedMethod = flow.authMethods.find(
+      (m) => m.methodIndex === flow.selectedMethodIndex,
+    );
     setConnectFlow({ ...flow, step: "begin", error: null, loading: true });
     try {
       const res = await tenvyrApi.openCodeOauthBegin(
         connectionId,
         providerId,
         flow.selectedMethodIndex,
+        selectedMethod ? { type: selectedMethod.type, label: selectedMethod.label } : undefined,
       );
       const command = parseWorkbenchCommandResult<OpenCodeAuthBeginV1>(res.data);
       if (command.outcome === "executed" || command.outcome === "duplicate") {
@@ -1964,9 +2011,20 @@ export default function RuntimesPage() {
                                   <button
                                     type="button"
                                     className="btn btn-secondary btn-sm"
-                                    onClick={() => {
+                                    onClick={async () => {
                                       setSignInKind(null);
-                                      loadData();
+                                      await loadData();
+                                      // P1: Check Again completes the login loop — if auth is now ready, revalidate the existing connection
+                                      try {
+                                        const freshStatus = await tenvyrApi.getRuntimeOnboarding(kind);
+                                        if (freshStatus?.status?.authReady) {
+                                          const existing = connections.find((c) => c.runtimeKind === kind && !c.revoked);
+                                          if (existing) {
+                                            await handleTest(existing.connectionId);
+                                          }
+                                        }
+                                      } catch {}
+                                      await loadData();
                                     }}
                                   >
                                     <RefreshCw size={12} />

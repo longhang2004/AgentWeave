@@ -10,6 +10,7 @@
 import {
   CONNECTION_STATUS_REASON_CODES,
   CONNECTION_STATUS_STATES,
+  type ActiveAuthFlowV1,
   type ConnectionStatusReasonCode,
   type ConnectionStatusState,
   type ConnectionTestReceiptV1,
@@ -333,6 +334,79 @@ function isSafeHttpUrl(value: string): boolean {
     return Boolean(parsed.hostname);
   } catch {
     return false;
+  }
+}
+
+/** Post-PP1 hardening: strict parse of the browser-reload resume surface —
+ *  bounded non-secret fields only; a malformed entry is dropped, never
+ *  optimistically rendered. */
+export function parseActiveAuthFlows(value: unknown): ActiveAuthFlowV1[] {
+  if (!Array.isArray(value)) throw new MalformedResponseError("active auth flows");
+  const flows: ActiveAuthFlowV1[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) continue;
+    if (
+      typeof entry.authFlowId !== "string" ||
+      !/^[0-9a-f]{32}$/.test(entry.authFlowId)
+    ) {
+      continue;
+    }
+    if (typeof entry.url !== "string" || !isSafeHttpUrl(entry.url)) continue;
+    if (entry.authorizationMethod !== "auto" && entry.authorizationMethod !== "code") {
+      continue;
+    }
+    if (
+      entry.methodType !== "oauth" &&
+      entry.methodType !== "api"
+    ) {
+      continue;
+    }
+    flows.push({
+      authFlowId: entry.authFlowId,
+      connectionId: String(entry.connectionId ?? ""),
+      connectionRevision:
+        typeof entry.connectionRevision === "number" ? entry.connectionRevision : 0,
+      providerId: String(entry.providerId ?? ""),
+      methodIndex: typeof entry.methodIndex === "number" ? entry.methodIndex : 0,
+      methodType: entry.methodType,
+      methodLabel: typeof entry.methodLabel === "string" ? entry.methodLabel : "",
+      url: entry.url,
+      authorizationMethod: entry.authorizationMethod,
+      instructions: typeof entry.instructions === "string" ? entry.instructions : null,
+      expiresAt: typeof entry.expiresAt === "number" ? entry.expiresAt : 0,
+    });
+  }
+  return flows;
+}
+
+/** Post-PP1 hardening: truthful run-picker readiness. Core filtering is
+ *  accepted backend authority; this only labels it. REVOKED is never
+ *  selectable; AUTH_REQUIRED points at the Runtimes sign-in; UNAVAILABLE
+ *  carries its reason; DEGRADED stays selectable but visibly warned. */
+export function pickerReadiness(c: {
+  revoked: boolean;
+  status: string;
+  reasonCode: string | null;
+}): { selectable: boolean; reason: string | null } {
+  if (c.revoked || c.status === "REVOKED") {
+    return { selectable: false, reason: "Revoked" };
+  }
+  switch (c.status) {
+    case "AVAILABLE":
+      return { selectable: true, reason: null };
+    case "DEGRADED":
+      return { selectable: true, reason: "Degraded — may fail" };
+    case "AUTH_REQUIRED":
+      return { selectable: false, reason: "Sign in on Runtimes" };
+    case "UNAVAILABLE":
+      return {
+        selectable: false,
+        reason: c.reasonCode ? `Unavailable (${c.reasonCode})` : "Unavailable",
+      };
+    case "DRAFT":
+      return { selectable: false, reason: "Not tested yet" };
+    default:
+      return { selectable: false, reason: "Status unknown" };
   }
 }
 

@@ -51,10 +51,7 @@ export type RuntimeOnboardingStatusV1 = {
   version: string | null;
   pinnedVersion: string;
   authReady: boolean | null;
-  /** Official runtime-owned login command for the guided Sign-in action
-   *  (Tenvyr never collects provider credentials). */
   loginCommand: string;
-  /** Fixed model-argument argv prefix documented for the runtime. */
   modelArgvPrefix: string[];
   guidance: string[];
   docUrl: string;
@@ -268,7 +265,9 @@ export type ProviderAuthMethodsV1 = {
 };
 
 /** Bounded result of BEGINNING the runtime-owned auth flow. The same live
- *  management session completes the flow. */
+ *  management session completes the flow. `resumed` marks an idempotent
+ *  Begin that returned an EXISTING compatible flow (no new session, no new
+ *  authorize). */
 export type OpenCodeAuthBeginV1 = {
   authFlowId: string;
   url: string;
@@ -277,6 +276,24 @@ export type OpenCodeAuthBeginV1 = {
   connectionId: string;
   connectionRevision: number;
   providerId: string;
+  resumed?: boolean;
+};
+
+/** Post-PP1 hardening: bounded NON-SECRET view of one active unexpired
+ *  auth flow — the browser-reload resume surface. NEVER carries the
+ *  management-server password/token. */
+export type ActiveAuthFlowV1 = {
+  authFlowId: string;
+  connectionId: string;
+  connectionRevision: number;
+  providerId: string;
+  methodIndex: number;
+  methodType: "oauth" | "api";
+  methodLabel: string;
+  url: string;
+  authorizationMethod: "auto" | "code";
+  instructions: string | null;
+  expiresAt: number;
 };
 
 /** Bounded evidence of a REAL runtime invocation for a target. "ok" only

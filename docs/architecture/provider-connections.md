@@ -4,15 +4,19 @@ status: current
 audience:
   - developer
   - operator
-last_verified: 2026-08-16
+last_verified: 2026-09-10
 sources:
   - services/orchestrator/src/executors/model-source.ts
   - services/orchestrator/src/services/model-source.service.ts
   - services/orchestrator/src/services/model-discovery.service.ts
+  - services/orchestrator/src/services/opencode-auth-flow.service.ts
+  - services/orchestrator/src/services/provider-discovery.service.ts
+  - services/orchestrator/src/provider-discovery.controller.ts
   - services/orchestrator/src/domain/coordination.ts
   - services/orchestrator/src/executors/executor-descriptor.ts
   - services/local-executor-host/src/supervisor.ts
   - packages/contracts/src/types.ts
+  - frontend/src/lib/tenvyr-api/guards.ts
 ---
 
 # Provider Connections and Runtime Targets (P2)
@@ -229,18 +233,59 @@ callback MUST target the same live `opencode serve` instance that
 performed authorize. `OpenCodeAuthFlow` owns that lifecycle:
 
 ```text
-begin (resolve exact revision -> start 127.0.0.1 server -> fetch methods
-       -> validate methodIndex/prompts -> POST authorize {method}
-       -> RETAIN the session)
+begin (classify existing flow FIRST — compatible reuse / conflict with
+       ZERO new server and ZERO authorize — then resolve exact revision ->
+       start 127.0.0.1 server -> fetch methods -> validate methodIndex +
+       expected type/label fingerprint + prompts -> POST authorize
+       {method} -> RETAIN the session + its authorization URL)
   -> bounded { authFlowId, url, method: auto|code, instructions }
 operator completes provider-owned flow
 complete (SAME session -> POST callback {method, code?} -> GET /provider
        -> prove connected -> close server -> remove flow)
+resume (browser reload -> GET /provider-discovery/auth-flows/active
+       ?connectionId=...[&providerId=...] returns the SAME authFlowId,
+       stored URL, method identity, instructions, expiry — bounded,
+       non-secret; never the management-server password/token)
 ```
+
+Post-PP1 hardening invariants:
+
+- **OAuth flow authority is fenced to the CURRENT RuntimeConnection
+  revision.** A flow is bound to exact connectionId + current revision +
+  providerId, and the connection must not be REVOKED. Begin resolves the
+  authoritative CURRENT state INSIDE the per-(connection, provider) mutex
+  (never a pre-lock snapshot), so concurrent Begins that race a revision
+  transition serialize and authorize exactly once under the current
+  revision.
+- **Stale flows fail closed.** A flow from an OLD revision is stale: its
+  retained management session is closed and the flow removed at the next
+  Resume/Complete/Begin — no provider callback ever fires against it, and
+  the stale authorization URL is never exposed. Complete on a revoked
+  connection fails `CONNECTION_REVOKED`; Complete across a revision change
+  fails `AUTH_FLOW_STALE` — both with callback count 0.
+- **Idempotent Begin before side effects** — a duplicate compatible Begin
+  (same connectionId, current connectionRevision, providerId, methodIndex,
+  expected method fingerprint) returns the EXISTING flow with its ORIGINAL
+  URL: one server start, one authorize, ever — sequentially AND under
+  `Promise.all` concurrency. An incompatible active flow fails closed with
+  `AUTH_FLOW_CONFLICT` before any new server or authorize. The
+  max-active-flows bound is enforced AFTER the compatible lookup, so an
+  existing flow stays retrievable at capacity.
+- **Method identity is revalidated** — Begin carries the selected method's
+  expected `type` + `label` from the UI snapshot; a fresh snapshot that
+  moved a different method to that index fails closed with
+  `AUTH_METHOD_INVALID` and ZERO authorize calls.
+- **Browser reload resume** — the Runtimes page restores an active
+  unexpired flow on load (same URL/instructions; Complete/Cancel continue
+  through the SAME retained session) ONLY while the connection is still
+  current and non-revoked. Revoking or revising the connection invalidates
+  the pending flow; an expired flow resumes as nothing: the operator starts
+  fresh. Cancel remains pure cleanup and may destroy a stale flow without
+  authority checks.
 
 Bounds: cryptographically random opaque authFlowId, 5-minute TTL, max 8
 active flows, one flow per (connection, provider), cancel endpoint,
-deterministic cleanup (TTL sweep closes the session), fail-closed on
+deterministic cleanup (TTL timer closes the session), fail-closed on
 process restart (the OpenCode pending state is gone — start again). The
 server stays 127.0.0.1 with a random password; passwords, tokens, and
 codes are never returned, logged, or persisted.

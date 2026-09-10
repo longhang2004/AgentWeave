@@ -73,6 +73,8 @@ export type RuntimeOnboardingStatus = {
   modelArgvPrefix: string[];
   /** Bounded guidance, never credential instructions. */
   guidance: string[];
+  /** Authoritative installation documentation URL from runtime template. */
+  docUrl: string;
   /** Ready-to-submit connect payload (executable + template defaults). */
   connectPayload: {
     runtimeKind: OnboardingRuntimeKind;
@@ -108,6 +110,7 @@ export class RuntimeOnboardingService {
         loginCommand: template.loginCommand,
         modelArgvPrefix: template.modelArgvPrefix,
         guidance,
+        docUrl: template.sourceUrl,
         connectPayload: null,
       };
     }
@@ -179,6 +182,7 @@ export class RuntimeOnboardingService {
       loginCommand: template.loginCommand,
       modelArgvPrefix: template.modelArgvPrefix,
       guidance,
+      docUrl: template.sourceUrl,
       connectPayload: {
         runtimeKind,
         executable,

@@ -11,7 +11,7 @@
     "start": "next start -p 4000",
     "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "node --test src/app/dashboard/safe-preview.test.mjs src/lib/tenvyr-api/client.test.mjs src/lib/tenvyr-api/guards.test.mjs",
+    "test": "node --test src/app/dashboard/safe-preview.test.mjs src/lib/tenvyr-api/client.test.mjs src/lib/tenvyr-api/guards.test.mjs src/lib/tenvyr-api/picker-readiness.test.mjs",
     "test:safe-preview": "node --test src/app/dashboard/safe-preview.test.mjs"
   },
   "dependencies": {

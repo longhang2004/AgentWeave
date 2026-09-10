@@ -14,11 +14,13 @@ import { WorkspaceExecutionService } from "./workspace-execution.service";
  * PP1 Slice B — Attention Queue V1 (READ PROJECTION).
  *
  * Derives exception-driven attention from existing durable authority rows;
- * nothing is persisted and nothing resolves authority. A lazy
- * workspace-execution reconciliation runs first so terminal-run leases
- * surface their preserved state. Deterministic ids → polling cannot
+ * nothing is persisted and nothing resolves authority. No durable state
+ * transition and no filesystem mutation is performed here. Terminal-run
+ * leases become PRESERVED via the authoritative run-completion path
+ * (preserveExecutionWorkspaceForRun inside the coordination transaction),
+ * not via lazy Attention polling. Deterministic ids → polling cannot
  * duplicate items; an item exists exactly while its durable source
- * condition exists.
+ * condition exists. Continuation/preservation does not depend on Attention.
  */
 @Injectable()
 export class AttentionService {
@@ -33,9 +35,6 @@ export class AttentionService {
   private readonly workspaceExecutions: WorkspaceExecutionService;
 
   async attention(): Promise<{ items: AttentionItemV1[]; serverTime: string }> {
-    // Lazy reconciliation: terminal-run leases become PRESERVED (with
-    // hasUncommittedWork captured) so the projection sees durable truth.
-    await this.workspaceExecutions.reconcileWorkspaceExecutions();
 
     const runs = await this.dataSource
       .getRepository(CoordinationRunEntity)

@@ -6,6 +6,8 @@ import {
   addGitWorktree,
   removeGitWorktree,
   worktreeIsRegistered,
+  getGitRunner,
+  setGitRunner,
 } from "./workspace-execution.service";
 
 /**
@@ -49,7 +51,7 @@ describeWithGit("PP1 git worktree helpers", () => {
       const error = addGitWorktree(repo.root, executionPath, "tenvyr/run-test");
       expect(error).toBeNull();
       expect(existsSync(join(executionPath, "README.md"))).toBe(true);
-      expect(worktreeIsRegistered(repo.root, executionPath)).toBe(true);
+      expect(worktreeIsRegistered(repo.root, executionPath)).toBe("REGISTERED");
       // Distinct from the source tree.
       expect(executionPath).not.toBe(repo.root);
       const head = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
@@ -82,7 +84,7 @@ describeWithGit("PP1 git worktree helpers", () => {
       expect(
         addGitWorktree(repo.root, executionPath, "tenvyr/run-retry"),
       ).toBeNull();
-      expect(worktreeIsRegistered(repo.root, executionPath)).toBe(true);
+      expect(worktreeIsRegistered(repo.root, executionPath)).toBe("REGISTERED");
       rmSync(executionPath, { recursive: true, force: true });
     } finally {
       repo.cleanup();
@@ -100,7 +102,7 @@ describeWithGit("PP1 git worktree helpers", () => {
       const outcome = removeGitWorktree(repo.root, executionPath);
       expect(outcome).toBe("removed");
       expect(existsSync(executionPath)).toBe(false);
-      expect(worktreeIsRegistered(repo.root, executionPath)).toBe(false);
+      expect(worktreeIsRegistered(repo.root, executionPath)).toBe("ABSENT");
     } finally {
       repo.cleanup();
     }
@@ -121,7 +123,7 @@ describeWithGit("PP1 git worktree helpers", () => {
       expect((outcome as { refused: string }).refused).toMatch(/cannot remove|dirty|matches/i);
       // The dirty tree still exists with the work intact.
       expect(existsSync(join(executionPath, "agent-work.txt"))).toBe(true);
-      expect(worktreeIsRegistered(repo.root, executionPath)).toBe(true);
+      expect(worktreeIsRegistered(repo.root, executionPath)).toBe("REGISTERED");
       rmSync(executionPath, { recursive: true, force: true });
     } finally {
       repo.cleanup();
@@ -152,9 +154,41 @@ describeWithGit("PP1 git worktree helpers", () => {
     const repo = initRepo();
     try {
       const ghost = join(repo.root, "..", `run-ghost-${Date.now()}`);
-      expect(worktreeIsRegistered(repo.root, ghost)).toBe(false);
+      expect(worktreeIsRegistered(repo.root, ghost)).toBe("ABSENT");
     } finally {
       repo.cleanup();
+    }
+  });
+
+  it("returns UNKNOWN when worktree listing evidence fails or is malformed", () => {
+    const previous = getGitRunner();
+    try {
+      setGitRunner(() => ({ status: null, stdout: "", stderr: "timeout" }));
+      expect(worktreeIsRegistered("/repo", "/repo/worktree")).toBe("UNKNOWN");
+
+      setGitRunner(() => ({ status: 0, stdout: "", stderr: "" }));
+      expect(worktreeIsRegistered("/repo", "/repo/worktree")).toBe("UNKNOWN");
+
+      setGitRunner(() => ({ status: 0, stdout: "not porcelain", stderr: "" }));
+      expect(worktreeIsRegistered("/repo", "/repo/worktree")).toBe("UNKNOWN");
+    } finally {
+      setGitRunner(previous);
+    }
+  });
+
+  it("returns WORKTREE_STATE_UNKNOWN when removal fails and registration cannot be observed", () => {
+    const previous = getGitRunner();
+    try {
+      setGitRunner((_cwd, args) =>
+        args[0] === "worktree" && args[1] === "remove"
+          ? { status: 1, stdout: "", stderr: "git is unavailable" }
+          : { status: null, stdout: "", stderr: "timeout" },
+      );
+      expect(removeGitWorktree("/repo", "/repo/worktree")).toMatchObject({
+        code: "WORKTREE_STATE_UNKNOWN",
+      });
+    } finally {
+      setGitRunner(previous);
     }
   });
 });

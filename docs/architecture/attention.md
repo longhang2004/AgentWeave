@@ -4,7 +4,7 @@ status: current
 audience:
   - developer
   - operator
-last_verified: 2026-08-17
+last_verified: 2026-09-10
 sources:
   - services/orchestrator/src/domain/attention.ts
   - services/orchestrator/src/services/attention.service.ts
@@ -40,8 +40,14 @@ activity.
 | `WORKSPACE_REQUIRES_ATTENTION` | preserved git-worktree lease with `hasUncommittedWork = true` | info | `/runs/<id>` / `/workspaces` |
 
 No "blocked" or "conflict" states are manufactured from guesses. The
-projection lazily reconciles workspace leases on read so terminal-run
-leases surface their preserved state.
+projection performs **no durable state transition and no filesystem
+mutation** — it is a pure READ projection over existing durable rows.
+Terminal-run leases become `PRESERVED` via the authoritative
+run-completion path (`preserveExecutionWorkspaceForRun` inside the
+coordination transaction), not via lazy `GET /workbench/attention`
+polling; continuation/preservation does not depend on Attention polling.
+Crash-reconciliation for workspace lifecycles, if needed, lives in an
+explicit lifecycle/recovery mechanism, not in the read projection.
 
 ## Surfaces
 

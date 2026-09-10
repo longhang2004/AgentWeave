@@ -76,11 +76,11 @@ export class WorkspaceExecutionEntity {
   @Column({ type: "boolean", nullable: true })
   hasUncommittedWork: boolean | null;
 
-  /** PP1 FINAL CLOSURE: exact durable correlation for release.
-   *  Holds the OperatorAction id that atomically claimed the target (PRESERVED/FAILED → RELEASE_REQUESTED via CAS).
-   *  On terminal release (REMOVED or PRESERVED refusal) it remains as the last/exact correlation for audit; a new
-   *  release may only replace it via the target-level CAS which requires PRESERVED/FAILED. Null means no release
-   *  has ever been claimed; legacy RELEASE_REQUESTED without it fails closed (RELEASE_UNAUTHORIZED). */
+  /** PP1: exact active correlation for release ownership.
+   *  Holds the OperatorAction id only while the target is RELEASE_REQUESTED.
+   *  Terminal finalization retires it atomically with the release lock; audit
+   *  history remains in OperatorAction. Legacy RELEASE_REQUESTED without it
+   *  fails closed (RELEASE_UNAUTHORIZED). */
   @Column({ type: "varchar", length: 36, nullable: true })
   releaseOperationId: string | null;
 

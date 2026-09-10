@@ -282,7 +282,7 @@ describe("EngineService behavior", () => {
     await service.resumeAfterResult("execution-1", "review");
 
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://localhost:3000/api/webhooks/execution-update",
+      "http://127.0.0.1:3000/api/webhooks/execution-update",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ executionId: "execution-1" }),
@@ -334,7 +334,7 @@ describe("EngineService behavior", () => {
     expect(transport.invoke).not.toHaveBeenCalled();
     // Progress was made, so the Gateway projection runs.
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://localhost:3000/api/webhooks/execution-update",
+      "http://127.0.0.1:3000/api/webhooks/execution-update",
       expect.anything(),
     );
   });
@@ -498,7 +498,7 @@ describe("EngineService behavior", () => {
     expect(outbox.dispatchNext).not.toHaveBeenCalled();
     // The terminal failure was projected.
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://localhost:3000/api/webhooks/execution-update",
+      "http://127.0.0.1:3000/api/webhooks/execution-update",
       expect.anything(),
     );
   });
@@ -534,7 +534,7 @@ describe("EngineService behavior", () => {
       "execution-other",
     );
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://localhost:3000/api/webhooks/execution-update",
+      "http://127.0.0.1:3000/api/webhooks/execution-update",
       expect.anything(),
     );
   });

@@ -113,14 +113,17 @@
     "services/gateway/src"
    ],
    "tests": [
-    "services/gateway/src/app.controller.spec.ts"
+    "services/gateway/src/app.controller.spec.ts",
+    "services/gateway/src/local-origin.spec.ts"
    ],
    "docs": [
-    "docs/architecture/control-plane.md"
+    "docs/architecture/control-plane.md",
+    "docs/operations/configuration.md"
    ],
    "limitations": [
     "Thin HTTP and WebSocket relay; no production agent-memory API",
-    "API and Gateway webhook endpoints are unauthenticated by design in Milestone 0; authentication is an explicit future security requirement before externally exposed production deployment or auth milestones"
+    "API and Gateway webhook endpoints are unauthenticated by design in Milestone 0; authentication is an explicit future security requirement before externally exposed production deployment or auth milestones",
+    "Local boundary: loopback default bind; CORS_ORIGIN is a bounded explicit allow-list shared by HTTP and WebSocket; a literal '*' fails closed"
    ]
   },
   {

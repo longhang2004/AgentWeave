@@ -12,6 +12,9 @@ sources:
   - services/local-executor-host-rs/src/host.rs
   - services/gateway/src/main.ts
   - services/gateway/src/app.controller.ts
+  - services/gateway/src/local-origin.ts
+  - services/orchestrator/src/main.ts
+  - services/orchestrator/src/local-origin.ts
   - services/orchestrator/src/agent-adapters/agent-transport-config.service.ts
   - services/orchestrator/src/database/database.provider.ts
   - services/orchestrator/src/database/data-source.ts
@@ -32,6 +35,8 @@ Values below are variable names and source defaults, never production secret val
 | Variable                             | Requirement and default                                                                                     |
 | ------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | `ORCHESTRATOR_PORT`                  | Optional; defaults to `3001`. The service does not read generic `PORT`.                                     |
+| `ORCHESTRATOR_HOST`                  | Optional; defaults to `127.0.0.1` (IPv4 loopback). Override only for a deliberate non-local architecture.   |
+| `CORS_ORIGIN`                        | Optional comma-separated allow-list of explicit origins shared with the WebSocket policy. Unset means NO HTTP CORS (the Workbench same-origin proxy needs none). A literal `*` is REJECTED and fails startup — never a wildcard. |
 | `POSTGRES_HOST`, `POSTGRES_PORT`     | Optional; default `localhost`, `5432`.                                                                      |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | Optional; both default to `postgres` for local development. Supply secrets outside source control.          |
 | `POSTGRES_DB`                        | Optional; uses the persistent compatibility default recorded in `.env.example`.                             |
@@ -39,7 +44,7 @@ Values below are variable names and source defaults, never production secret val
 | `TENVYR_DB_SYNCHRONIZE`              | Disposable development only; exact `true` works only with `NODE_ENV=development`. Always off in production. |
 | `KAFKA_BROKERS`                      | Optional comma-separated brokers; defaults to `localhost:9092`.                                             |
 | `KAFKA_CLIENT_ID`                    | Optional; legacy compatibility default `agentweave-orchestrator`.                                           |
-| `GATEWAY_URL`                        | Optional; defaults to `http://localhost:3000`.                                                              |
+| `GATEWAY_URL`                        | Optional; defaults to `http://127.0.0.1:3000` (explicit IPv4 loopback; never localhost address-family dependent). |
 | `ORCHESTRATOR_AGENT_NAMES`           | Optional; defaults to `code-reviewer,observability`.                                                        |
 | `ORCHESTRATOR_RESULT_TOPICS`         | Optional comma-separated additional result topics; empty by default.                                        |
 
@@ -104,7 +109,26 @@ group is killed at the earlier of the invocation deadline and `wallTimeMs`
 | Variable           | Requirement and default                                                 |
 | ------------------ | ----------------------------------------------------------------------- |
 | `GATEWAY_PORT`     | Optional; defaults to `3000`. The service does not read generic `PORT`. |
-| `ORCHESTRATOR_URL` | Optional; defaults to `http://localhost:3001`.                          |
+| `GATEWAY_HOST`     | Optional; defaults to `127.0.0.1` (IPv4 loopback).                      |
+| `CORS_ORIGIN`      | Optional comma-separated allow-list of explicit origins; shared with the Orchestrator semantics. Unset means NO HTTP CORS. A literal `*` is REJECTED and fails startup. |
+| `ORCHESTRATOR_URL` | Optional; defaults to `http://127.0.0.1:3001` (explicit IPv4 loopback). |
+
+### Local boundary and CORS (Gateway + Orchestrator)
+
+Both services default-bind IPv4 loopback (`127.0.0.1`) and share ONE
+explicit local-origin policy (`local-origin.ts`, byte-identical twins in
+each service, drift-checked by tests):
+
+- Default local operation accepts no arbitrary browser origins: HTTP has no
+  CORS at all, and the Socket.IO/WebSocket endpoint grants only loopback
+  browser origins (`127.0.0.1`/`localhost`/`[::1]`, any port).
+- `CORS_ORIGIN=a,b` sets a bounded explicit allow-list for BOTH HTTP and
+  WebSocket; listing it replaces the default loopback WebSocket grant.
+- A literal `*` anywhere in `CORS_ORIGIN` fails closed at startup — it is
+  never passed to Nest or Socket.IO.
+- The Workbench same-origin proxy keeps working with no configuration.
+- Human-facing summaries may display `localhost`; internal defaults are
+  always explicit `127.0.0.1`.
 
 The current Gateway source does not consume the `JWT_*`, Redis, or Postgres values listed under the Gateway heading in `.env.example`. They are not current Gateway API configuration.
 

@@ -5,10 +5,15 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { socketIoCorsOrigin } from './local-origin';
 
+// Post-PP1 hardening: the WebSocket boundary shares the HTTP local-origin
+// policy — explicit bounded allow-list via CORS_ORIGIN, loopback browser
+// origins by default, wildcard "*" rejected (never reaches Socket.IO).
 @WebSocketGateway({
   cors: {
-    origin: '*',
+    origin: socketIoCorsOrigin(process.env.CORS_ORIGIN),
+    credentials: true,
   },
 })
 export class SocketGateway implements OnGatewayConnection, OnGatewayDisconnect {

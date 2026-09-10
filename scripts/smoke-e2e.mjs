@@ -9,16 +9,18 @@ const EXIT_EXECUTION = 4;
 const EXIT_TIMEOUT = 5;
 const EXIT_PREREQ = 7;
 
-const GATEWAY = process.env.SMOKE_GATEWAY_URL || "http://localhost:3000";
+// Internal defaults target services bound to explicit IPv4 loopback;
+// overrides preserved for non-default topologies.
+const GATEWAY = process.env.SMOKE_GATEWAY_URL || "http://127.0.0.1:3000";
 const ORCHESTRATOR =
-  process.env.SMOKE_ORCHESTRATOR_URL || "http://localhost:3001";
+  process.env.SMOKE_ORCHESTRATOR_URL || "http://127.0.0.1:3001";
 const CODE_REVIEWER =
   process.env.SMOKE_CODE_REVIEWER_URL || "http://localhost:3002";
 const OBSERVABILITY =
   process.env.SMOKE_OBSERVABILITY_URL || "http://localhost:3003";
 const RUNNER = process.env.SMOKE_RUNNER_URL || "http://localhost:8085";
 const PYTHON_WORKER =
-  process.env.SMOKE_PYTHON_WORKER_URL || "http://localhost:8080";
+  process.env.SMOKE_PYTHON_WORKER_URL || "http://127.0.0.1:8080";
 const FRONTEND = process.env.SMOKE_FRONTEND_URL || "http://localhost:4000";
 
 const POLL_INTERVAL_MS = Number(process.env.SMOKE_POLL_INTERVAL_MS || 1000);

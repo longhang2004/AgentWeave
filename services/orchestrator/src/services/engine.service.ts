@@ -935,7 +935,9 @@ export class EngineService {
 
   private async notifyGatewayUpdate(executionId: string) {
     try {
-      const gatewayUrl = process.env.GATEWAY_URL || "http://localhost:3000";
+      // Internal loopback default — explicit IPv4, never localhost
+      // address-family dependent; GATEWAY_URL override preserved.
+      const gatewayUrl = process.env.GATEWAY_URL || "http://127.0.0.1:3000";
       const response = await fetch(
         `${gatewayUrl}/api/webhooks/execution-update`,
         {

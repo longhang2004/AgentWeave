@@ -1,9 +1,9 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { selectBootstrapLogger, TenvyrDevLogger } from './dev-logger';
+import { resolveHttpBoundary } from './local-origin';
 
 async function bootstrap() {
-  const port = process.env.GATEWAY_PORT || 3000;
   // Terminal-UX closure: the compact presenter is a DEVELOPMENT-only
   // presentation. Production and verbose use NATIVE Nest logging.
   const loggerMode = selectBootstrapLogger();
@@ -13,10 +13,17 @@ async function bootstrap() {
   });
   if (devLogger) app.useLogger(devLogger);
 
-  // Enable CORS
-  app.enableCors();
+  // P0 control-plane boundary: loopback-only by default, no wildcard CORS.
+  const boundary = resolveHttpBoundary(
+    { hostEnv: "GATEWAY_HOST", portEnv: "GATEWAY_PORT", defaultPort: 3000 },
+    process.env,
+  );
+  if (boundary.corsOrigin) {
+    app.enableCors({ origin: boundary.corsOrigin, credentials: true });
+  }
 
-  await app.listen(port);
-  (devLogger ?? console).log(`Gateway listening on http://localhost:${port}`);
+  await app.listen(boundary.port, boundary.host);
+  // Human-facing summary may say localhost; the bind is loopback IPv4.
+  (devLogger ?? console).log(`Gateway listening on http://localhost:${boundary.port}`);
 }
 bootstrap();
